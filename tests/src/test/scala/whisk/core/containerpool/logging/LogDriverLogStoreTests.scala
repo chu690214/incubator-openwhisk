@@ -40,7 +40,7 @@ class LogDriverLogStoreTests extends TestKit(ActorSystem("LogDriverLogStore")) w
   }
 
   it should "set the container parameters from the config" in {
-    val logDriverLogStore = new LogDriverLogStore(system, Some(testConfig))
+    val logDriverLogStore = new LogDriverLogStore(system, testConfig)
     logDriverLogStore.logParameters shouldBe Map(
       "--log-driver" -> Set("fluentd"),
       "--log-opt" -> Set("fluentd-address=localhost:24225", "tag=OW_CONTAINER"))

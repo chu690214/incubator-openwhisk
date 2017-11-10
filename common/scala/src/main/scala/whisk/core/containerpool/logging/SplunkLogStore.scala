@@ -70,23 +70,22 @@ case class SplunkLogStoreConfig(message: String,
 class SplunkLogStore(
   actorSystem: ActorSystem,
   httpFlow: Option[Flow[(HttpRequest, Promise[HttpResponse]), (Try[HttpResponse], Promise[HttpResponse]), Any]] = None,
-  configOpt: Option[SplunkLogStoreConfig] = None)
-    extends LogDriverLogStore(actorSystem, configOpt) {
+  config: SplunkLogStoreConfig = loadConfigOrThrow[SplunkLogStoreConfig]("whisk.logstore.splunk"))
+    extends LogDriverLogStore(actorSystem, config) {
   implicit val as = actorSystem
   implicit val ec = as.dispatcher
   implicit val materializer = ActorMaterializer()
 
   private val splunkApi = "/services/search/jobs" //see http://docs.splunk.com/Documentation/Splunk/6.6.3/RESTREF/RESTsearch#search.2Fjobs
 
-  val splunkConfig = configOpt.getOrElse(loadConfigOrThrow[SplunkLogStoreConfig]("whisk.logstore.splunk"))
   val log = actorSystem.log
   val maxPendingRequests = 500
 
   val defaultHttpFlow = Http().cachedHostConnectionPoolHttps[Promise[HttpResponse]](
-    host = splunkConfig.host,
-    port = splunkConfig.port,
+    host = config.host,
+    port = config.port,
     connectionContext =
-      if (splunkConfig.disableSNI)
+      if (config.disableSNI)
         Http().createClientHttpsContext(AkkaSSLConfig().mapSettings(s => s.withLoose(s.loose.withDisableSNI(true))))
       else Http().defaultClientHttpsContext)
 
@@ -97,7 +96,7 @@ class SplunkLogStore(
     //example response:
     //    {"preview":false,"init_offset":0,"messages":[],"fields":[{"name":"log_message"}],"results":[{"log_message":"some log message"}], "highlighted":{}}
     val search =
-      s"""search index="${splunkConfig.index}"| spath ${splunkConfig.activationIdField} | search ${splunkConfig.activationIdField}=${activation.activationId.toString} | table ${splunkConfig.logMessageField}"""
+      s"""search index="${config.index}"| spath ${config.activationIdField} | search ${config.activationIdField}=${activation.activationId.toString} | table ${config.logMessageField}"""
 
     val formatter = DateTimeFormatter.ofPattern("YYYY-MM-dd'T'hh:mm:ss").withZone(ZoneId.of("UTC"))
     val entity = FormData(
@@ -112,7 +111,7 @@ class SplunkLogStore(
     queueRequest(
       Post(splunkApi)
         .withEntity(entity)
-        .withHeaders(List(Authorization(BasicHttpCredentials(splunkConfig.username, splunkConfig.password)))))
+        .withHeaders(List(Authorization(BasicHttpCredentials(config.username, config.password)))))
       .flatMap(response => {
         log.debug(s"splunk API response ${response}")
         Unmarshal(response.entity)
@@ -127,7 +126,7 @@ class SplunkLogStore(
                 .convertTo[JsArray]
                 .elements
                 .map(msgJsValue => {
-                  msgJsValue.asJsObject.fields(splunkConfig.logMessageField).asInstanceOf[JsString].value
+                  msgJsValue.asJsObject.fields(config.logMessageField).asInstanceOf[JsString].value
                 })
               new ActivationLogs(messages)
             } else {

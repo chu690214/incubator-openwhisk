@@ -47,10 +47,10 @@ case class ConsumerlessLogDriverLogStoreConfig(message: String,
  * Docker log driver based LogStore impl. Uses docker log driver to emit container logs to an external store.
  * Fetching logs from that external store is not provided in this trait.
  */
-class LogDriverLogStore(actorSystem: ActorSystem, configOpt: Option[LogDriverLogStoreConfig] = None) extends LogStore {
-  val config =
-    configOpt.getOrElse(
-      loadConfigOrThrow[ConsumerlessLogDriverLogStoreConfig](actorSystem.settings.config, "whisk.logstore.log-driver"))
+class LogDriverLogStore(actorSystem: ActorSystem,
+                        config: LogDriverLogStoreConfig =
+                          loadConfigOrThrow[ConsumerlessLogDriverLogStoreConfig]("whisk.logstore.log-driver"))
+    extends LogStore {
   val logDriverMessage = config.message
   val logParameters =
     Map[String, Set[String]]("--log-driver" -> Set(config.dockerLogDriver)) ++

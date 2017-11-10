@@ -61,30 +61,6 @@ import whisk.core.entity.TimeLimit
 import whisk.core.entity.WhiskActivation
 import whisk.core.entity.size._
 
-object SplunkLogStoreTests {
-  val config = """
-    whisk.logstore {
-        log-driver {
-            message = "Logs are stored externally."
-            docker-log-driver = "fluentd"
-            docker-log-driver-opts = [ "tag=OW_CONTAINER", "fluentd-address=localhost:24225" ]
-        }
-
-        splunk {
-            host = "splunk-host"
-            port = 8080
-            user = "splunk-user"
-            password = "splunk-pass"
-            index = "splunk-index"
-            log-message-field = "log_message"
-            activation-id-field = "activation_id"
-            disableSNI = false
-        }
-    }
-    """
-
-}
-
 class SplunkLogStoreTests
     extends TestKit(ActorSystem("SplunkLogStore"))
     with FlatSpecLike
@@ -176,14 +152,14 @@ class SplunkLogStoreTests
   }
   it should "find logs based on activation timestamps" in {
     //use the a flow that asserts the request structure and provides a response in the expected format
-    val splunkStore = new SplunkLogStore(system, Some(testFlow), Some(testConfig))
+    val splunkStore = new SplunkLogStore(system, Some(testFlow), testConfig)
     val result = Await.result(splunkStore.fetchLogs(activation), 1.second)
     result shouldBe ActivationLogs(Vector("some log message", "some other log message"))
   }
 
   it should "fail to connect to bogus host" in {
     //use the default http flow with the default bogus-host config
-    val splunkStore = new SplunkLogStore(system, configOpt = Some(testConfig))
+    val splunkStore = new SplunkLogStore(system, config = testConfig)
     val result = splunkStore.fetchLogs(activation)
     whenReady(result.failed, Timeout(1.second)) { ex =>
       ex shouldBe an[StreamTcpException]
@@ -191,7 +167,7 @@ class SplunkLogStoreTests
   }
   it should "display an error if API cannot be reached" in {
     //use a flow that generates a 500 response
-    val splunkStore = new SplunkLogStore(system, Some(failFlow), Some(testConfig))
+    val splunkStore = new SplunkLogStore(system, Some(failFlow), testConfig)
     val result = splunkStore.fetchLogs(activation)
     whenReady(result.failed, Timeout(1.second)) { ex =>
       ex shouldBe an[RuntimeException]
