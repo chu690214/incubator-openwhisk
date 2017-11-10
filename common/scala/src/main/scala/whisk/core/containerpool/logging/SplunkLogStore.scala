@@ -35,6 +35,7 @@ import akka.stream.scaladsl.Flow
 import akka.stream.scaladsl.Keep
 import akka.stream.scaladsl.Sink
 import akka.stream.scaladsl.Source
+//import com.typesafe.config.ConfigObject
 import com.typesafe.sslconfig.akka.AkkaSSLConfig
 import scala.concurrent.Future
 import scala.concurrent.Promise
@@ -46,6 +47,20 @@ import spray.json.JsArray
 import spray.json._
 import whisk.core.entity.ActivationLogs
 import whisk.core.entity.WhiskActivation
+import pureconfig._
+
+case class SplunkLogStoreConfig(message: String,
+                                dockerLogDriver: String,
+                                dockerLogDriverOpts: Set[String],
+                                host: String,
+                                port: Int,
+                                username: String,
+                                password: String,
+                                index: String,
+                                logMessageField: String,
+                                activationIdField: String,
+                                disableSNI: Boolean)
+    extends LogDriverLogStoreConfig
 
 /**
  * A Splunk based impl of LogDriverLogStore. Logs are routed to splunk via docker log driver, and retrieved via Splunk REST API
@@ -54,30 +69,24 @@ import whisk.core.entity.WhiskActivation
  */
 class SplunkLogStore(
   actorSystem: ActorSystem,
-  httpFlow: Option[Flow[(HttpRequest, Promise[HttpResponse]), (Try[HttpResponse], Promise[HttpResponse]), Any]] = None)
-    extends LogDriverLogStore(actorSystem) {
+  httpFlow: Option[Flow[(HttpRequest, Promise[HttpResponse]), (Try[HttpResponse], Promise[HttpResponse]), Any]] = None,
+  configOpt: Option[SplunkLogStoreConfig] = None)
+    extends LogDriverLogStore(actorSystem, configOpt) {
   implicit val as = actorSystem
   implicit val ec = as.dispatcher
   implicit val materializer = ActorMaterializer()
 
-  val splunkHost = config.getString("whisk.logstore.splunk.host")
-  val splunkPort = config.getInt("whisk.logstore.splunk.port")
   private val splunkApi = "/services/search/jobs" //see http://docs.splunk.com/Documentation/Splunk/6.6.3/RESTREF/RESTsearch#search.2Fjobs
-  private val splunkUser = config.getString("whisk.logstore.splunk.user")
-  private val splunkPass = config.getString("whisk.logstore.splunk.password")
-  private val splunkIndex = config.getString("whisk.logstore.splunk.index")
-  private val logMessageFieldName = config.getString("whisk.logstore.splunk.log-message-field")
-  private val activationIdFieldName = config.getString("whisk.logstore.splunk.activation-id-field")
-  private val disableSNI = config.getBoolean("whisk.logstore.splunk.disableSNI")
 
+  val splunkConfig = configOpt.getOrElse(loadConfigOrThrow[SplunkLogStoreConfig]("whisk.logstore.splunk"))
   val log = actorSystem.log
   val maxPendingRequests = 500
 
   val defaultHttpFlow = Http().cachedHostConnectionPoolHttps[Promise[HttpResponse]](
-    host = splunkHost,
-    port = splunkPort,
+    host = splunkConfig.host,
+    port = splunkConfig.port,
     connectionContext =
-      if (disableSNI)
+      if (splunkConfig.disableSNI)
         Http().createClientHttpsContext(AkkaSSLConfig().mapSettings(s => s.withLoose(s.loose.withDisableSNI(true))))
       else Http().defaultClientHttpsContext)
 
@@ -88,7 +97,7 @@ class SplunkLogStore(
     //example response:
     //    {"preview":false,"init_offset":0,"messages":[],"fields":[{"name":"log_message"}],"results":[{"log_message":"some log message"}], "highlighted":{}}
     val search =
-      s"""search index="${splunkIndex}"| spath ${activationIdFieldName} | search ${activationIdFieldName}=${activation.activationId.toString} | table ${logMessageFieldName}"""
+      s"""search index="${splunkConfig.index}"| spath ${splunkConfig.activationIdField} | search ${splunkConfig.activationIdField}=${activation.activationId.toString} | table ${splunkConfig.logMessageField}"""
 
     val formatter = DateTimeFormatter.ofPattern("YYYY-MM-dd'T'hh:mm:ss").withZone(ZoneId.of("UTC"))
     val entity = FormData(
@@ -103,35 +112,36 @@ class SplunkLogStore(
     queueRequest(
       Post(splunkApi)
         .withEntity(entity)
-        .withHeaders(List(Authorization(BasicHttpCredentials(splunkUser, splunkPass))))).flatMap(response => {
-      log.debug(s"splunk API response ${response}")
-      if (response.status.isSuccess()) {
+        .withHeaders(List(Authorization(BasicHttpCredentials(splunkConfig.username, splunkConfig.password)))))
+      .flatMap(response => {
+        log.debug(s"splunk API response ${response}")
         Unmarshal(response.entity)
           .to[String]
           .map(resultsString => {
-            log.debug(s"splunk API results: ${resultsString}")
-            val jsObject = JsonParser(resultsString).asJsObject
-            //format of results is detailed here: http://docs.splunk.com/Documentation/Splunk/latest/RESTUM/RESTusing#Example_B:_JSON_response_format_example
-            val messages = jsObject
-              .fields("results")
-              .convertTo[JsArray]
-              .elements
-              .map(msgJsValue => {
-                msgJsValue.asJsObject.fields(logMessageFieldName).asInstanceOf[JsString].value
-              })
-            new ActivationLogs(messages)
+            if (response.status.isSuccess()) {
+              log.debug(s"splunk API results: ${resultsString}")
+              val jsObject = JsonParser(resultsString).asJsObject
+              //format of results is detailed here: http://docs.splunk.com/Documentation/Splunk/latest/RESTUM/RESTusing#Example_B:_JSON_response_format_example
+              val messages = jsObject
+                .fields("results")
+                .convertTo[JsArray]
+                .elements
+                .map(msgJsValue => {
+                  msgJsValue.asJsObject.fields(splunkConfig.logMessageField).asInstanceOf[JsString].value
+                })
+              new ActivationLogs(messages)
+            } else {
+              throw new RuntimeException(s"failed to read logs from splunk ${response}")
+            }
           })
-      } else {
-        Future.failed(new RuntimeException(s"failed to read logs from splunk ${response}"))
-      }
-    })
+      })
 
   }
 
   //based on http://doc.akka.io/docs/akka-http/10.0.6/scala/http/client-side/host-level.html
   val queue =
     Source
-      .queue[(HttpRequest, Promise[HttpResponse])](maxPendingRequests, OverflowStrategy.backpressure)
+      .queue[(HttpRequest, Promise[HttpResponse])](maxPendingRequests, OverflowStrategy.dropNew)
       .via(httpFlow.getOrElse(defaultHttpFlow))
       .toMat(Sink.foreach({
         case ((Success(resp), p)) => p.success(resp)

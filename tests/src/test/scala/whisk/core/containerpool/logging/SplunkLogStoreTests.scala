@@ -36,12 +36,11 @@ import whisk.core.entity.ActivationLogs
 import akka.http.scaladsl.model.StatusCodes
 import akka.stream.scaladsl.Flow
 import akka.testkit.TestKit
-import com.typesafe.config.ConfigFactory
 import java.time.LocalDateTime
 import java.time.ZoneOffset
 import org.scalatest.FlatSpecLike
+import pureconfig.error.ConfigReaderException
 import scala.concurrent.Await
-import scala.concurrent.Future
 import scala.concurrent.Promise
 import scala.concurrent.duration._
 import scala.util.Success
@@ -65,12 +64,12 @@ import whisk.core.entity.size._
 object SplunkLogStoreTests {
   val config = """
     whisk.logstore {
-        log-driver-message = "Logs are stored externally."
-        log-driver-opts = [
-            { "--log-driver" : "fluentd" },
-            { "--log-opt" : "tag=OW_CONTAINER" },
-            { "--log-opt" : "fluentd-address=localhost:24225" }
-        ]
+        log-driver {
+            message = "Logs are stored externally."
+            docker-log-driver = "fluentd"
+            docker-log-driver-opts = [ "tag=OW_CONTAINER", "fluentd-address=localhost:24225" ]
+        }
+
         splunk {
             host = "splunk-host"
             port = 8080
@@ -87,10 +86,23 @@ object SplunkLogStoreTests {
 }
 
 class SplunkLogStoreTests
-    extends TestKit(ActorSystem("SplunkLogStore", ConfigFactory.parseString(SplunkLogStoreTests.config)))
+    extends TestKit(ActorSystem("SplunkLogStore"))
     with FlatSpecLike
     with Matchers
     with ScalaFutures {
+  val testConfig = SplunkLogStoreConfig(
+    "logs are stored in splunk",
+    "fluentd",
+    Set("tag=OW_CONTAINER", "fluentd-address=localhost:24225"),
+    "splunk-host",
+    8080,
+    "splunk-user",
+    "splunk-pass",
+    "splunk-index",
+    "log_message",
+    "activation_id",
+    false)
+
   behavior of "Splunk LogStore"
 
   val startTime = "2007-12-03T10:15:30"
@@ -110,60 +122,43 @@ class SplunkLogStoreTests
   implicit val ec = system.dispatcher
   implicit val materializer = ActorMaterializer()
 
-  val splunkIndex = system.settings.config.getString("whisk.logstore.splunk.index")
-  val activationIdFieldName = system.settings.config.getString("whisk.logstore.splunk.activation-id-field")
-  val logMessageFieldName = system.settings.config.getString("whisk.logstore.splunk.log-message-field")
-  val splunkUser = system.settings.config.getString("whisk.logstore.splunk.user")
-  val splunkPwd = system.settings.config.getString("whisk.logstore.splunk.password")
-  val splunkHost = system.settings.config.getString("whisk.logstore.splunk.host")
-  val splunkPort = system.settings.config.getInt("whisk.logstore.splunk.port")
-
   val testFlow: Flow[(HttpRequest, Promise[HttpResponse]), (Try[HttpResponse], Promise[HttpResponse]), NotUsed] =
     Flow[(HttpRequest, Promise[HttpResponse])]
       .mapAsyncUnordered(1) {
         case (request, userContext) =>
-          //handle assertion errors so that stream does not swallow error info
-          try {
-            request.uri.path.toString() shouldBe "/services/search/jobs"
-            request.headers shouldBe List(Authorization.basic(splunkUser, splunkPwd))
-            //we use cachedHostConnectionPoolHttps so won't get the host+port with the request
-            Unmarshal(request.entity).to[FormData].map { form =>
-              //handle assertion errors so that stream does not swallow error info
-              try {
-                val earliestTime = form.fields.get("earliest_time")
-                val latestTime = form.fields.get("latest_time")
-                val outputMode = form.fields.get("output_mode")
-                val search = form.fields.get("search")
-                val execMode = form.fields.get("exec_mode")
+          //we use cachedHostConnectionPoolHttps so won't get the host+port with the request
+          Unmarshal(request.entity)
+            .to[FormData]
+            .map { form =>
+              val earliestTime = form.fields.get("earliest_time")
+              val latestTime = form.fields.get("latest_time")
+              val outputMode = form.fields.get("output_mode")
+              val search = form.fields.get("search")
+              val execMode = form.fields.get("exec_mode")
 
-                earliestTime shouldBe Some(startTime)
-                latestTime shouldBe Some(endTime)
-                outputMode shouldBe Some("json")
-                execMode shouldBe Some("oneshot")
-                search shouldBe Some(
-                  s"""search index="${splunkIndex}"| spath ${activationIdFieldName} | search ${activationIdFieldName}=${activation.activationId.toString} | table ${logMessageFieldName}""")
+              request.uri.path.toString() shouldBe "/services/search/jobs"
+              request.headers shouldBe List(Authorization.basic(testConfig.username, testConfig.password))
+              earliestTime shouldBe Some(startTime)
+              latestTime shouldBe Some(endTime)
+              outputMode shouldBe Some("json")
+              execMode shouldBe Some("oneshot")
+              search shouldBe Some(
+                s"""search index="${testConfig.index}"| spath ${testConfig.activationIdField} | search ${testConfig.activationIdField}=${activation.activationId.toString} | table ${testConfig.logMessageField}""")
 
-                (
-                  Success(
-                    HttpResponse(
-                      StatusCodes.OK,
-                      entity = HttpEntity(
-                        ContentTypes.`application/json`,
-                        """{"preview":false,"init_offset":0,"messages":[],"fields":[{"name":"log_message"}],"results":[{"log_message":"some log message"},{"log_message":"some other log message"}], "highlighted":{}}"""))),
-                  userContext)
-              } catch {
-                case e: Throwable =>
-                  (Failure(e), userContext)
-              }
-
+              (
+                Success(
+                  HttpResponse(
+                    StatusCodes.OK,
+                    entity = HttpEntity(
+                      ContentTypes.`application/json`,
+                      """{"preview":false,"init_offset":0,"messages":[],"fields":[{"name":"log_message"}],"results":[{"log_message":"some log message"},{"log_message":"some other log message"}], "highlighted":{}}"""))),
+                userContext)
             }
-          } catch {
-            case e: Throwable =>
-              Future {
+            .recover {
+              case e =>
+                println("failed")
                 (Failure(e), userContext)
-              }
-          }
-
+            }
       }
   val failFlow: Flow[(HttpRequest, Promise[HttpResponse]), (Try[HttpResponse], Promise[HttpResponse]), NotUsed] =
     Flow[(HttpRequest, Promise[HttpResponse])]
@@ -173,16 +168,22 @@ class SplunkLogStoreTests
 
       }
 
+  it should "fail when loading out of box configs (because whisk.logstore.splunk doesn't exist)" in {
+    assertThrows[ConfigReaderException[_]] {
+      val splunkStore = new SplunkLogStore(system)
+    }
+
+  }
   it should "find logs based on activation timestamps" in {
     //use the a flow that asserts the request structure and provides a response in the expected format
-    val splunkStore = new SplunkLogStore(system, Some(testFlow))
+    val splunkStore = new SplunkLogStore(system, Some(testFlow), Some(testConfig))
     val result = Await.result(splunkStore.fetchLogs(activation), 1.second)
     result shouldBe ActivationLogs(Vector("some log message", "some other log message"))
   }
 
   it should "fail to connect to bogus host" in {
     //use the default http flow with the default bogus-host config
-    val splunkStore = new SplunkLogStore(system)
+    val splunkStore = new SplunkLogStore(system, configOpt = Some(testConfig))
     val result = splunkStore.fetchLogs(activation)
     whenReady(result.failed, Timeout(1.second)) { ex =>
       ex shouldBe an[StreamTcpException]
@@ -190,7 +191,7 @@ class SplunkLogStoreTests
   }
   it should "display an error if API cannot be reached" in {
     //use a flow that generates a 500 response
-    val splunkStore = new SplunkLogStore(system, Some(failFlow))
+    val splunkStore = new SplunkLogStore(system, Some(failFlow), Some(testConfig))
     val result = splunkStore.fetchLogs(activation)
     whenReady(result.failed, Timeout(1.second)) { ex =>
       ex shouldBe an[RuntimeException]
@@ -198,10 +199,4 @@ class SplunkLogStoreTests
 
   }
 
-  it should "use the host and port from the config" in {
-    val splunkStore = new SplunkLogStore(system)
-    splunkStore.splunkHost shouldBe splunkHost
-    splunkStore.splunkPort shouldBe splunkPort
-
-  }
 }

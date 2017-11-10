@@ -19,21 +19,31 @@ package whisk.core.containerpool.logging
 
 import akka.actor.ActorSystem
 import akka.testkit.TestKit
-import com.typesafe.config.ConfigFactory
 import org.scalatest.FlatSpecLike
 import org.scalatest.Matchers
+import pureconfig.error.ConfigReaderException
 
-class LogDriverLogStoreTests
-    extends TestKit(ActorSystem("LogDriverLogStore", ConfigFactory.parseString(SplunkLogStoreTests.config)))
-    with FlatSpecLike
-    with Matchers {
+class LogDriverLogStoreTests extends TestKit(ActorSystem("LogDriverLogStore")) with FlatSpecLike with Matchers {
+
+  val testConfig = ConsumerlessLogDriverLogStoreConfig(
+    "some message",
+    "fluentd",
+    Set("fluentd-address=localhost:24225", "tag=OW_CONTAINER"))
 
   behavior of "LogDriver LogStore"
 
+  it should "fail when loading out of box configs (because whisk.logstore doesn't exist)" in {
+    assertThrows[ConfigReaderException[_]] {
+      val logDriverLogStore = new LogDriverLogStore(system)
+    }
+
+  }
+
   it should "set the container parameters from the config" in {
-    val logDriverLogStore = new LogDriverLogStore(system)
+    val logDriverLogStore = new LogDriverLogStore(system, Some(testConfig))
     logDriverLogStore.logParameters shouldBe Map(
       "--log-driver" -> Set("fluentd"),
       "--log-opt" -> Set("fluentd-address=localhost:24225", "tag=OW_CONTAINER"))
+    logDriverLogStore.logDriverMessage shouldBe "some message"
   }
 }

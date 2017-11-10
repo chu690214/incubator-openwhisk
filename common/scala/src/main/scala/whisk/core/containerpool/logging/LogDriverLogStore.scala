@@ -18,39 +18,43 @@
 package whisk.core.containerpool.logging
 
 import akka.actor.ActorSystem
-import scala.collection.JavaConverters._
-import scala.collection.mutable
+//import com.typesafe.config.ConfigObject
+//import com.typesafe.config.ConfigList
+//import com.typesafe.config.ConfigObject
+import pureconfig.loadConfigOrThrow
+//import scala.collection.JavaConverters._
+//import scala.collection.mutable
 import scala.concurrent.Future
 import whisk.common.TransactionId
 import whisk.core.containerpool.Container
 import whisk.core.entity.ActivationLogs
 import whisk.core.entity.ExecutableWhiskAction
 import whisk.core.entity.WhiskActivation
+import pureconfig._
+
+trait LogDriverLogStoreConfig {
+  def message: String
+  def dockerLogDriver: String
+  def dockerLogDriverOpts: Set[String]
+}
+
+case class ConsumerlessLogDriverLogStoreConfig(message: String,
+                                               dockerLogDriver: String,
+                                               dockerLogDriverOpts: Set[String])
+    extends LogDriverLogStoreConfig
 
 /**
  * Docker log driver based LogStore impl. Uses docker log driver to emit container logs to an external store.
  * Fetching logs from that external store is not provided in this trait.
  */
-class LogDriverLogStore(actorSystem: ActorSystem) extends LogStore {
-  val config = actorSystem.settings.config
-  val logDriverMessage = config.getString("whisk.logstore.log-driver-message")
-  val logParameters = mutable.Map[String, mutable.Set[String]]()
-
-  config
-    .getObjectList("whisk.logstore.log-driver-opts")
-    .asScala
-    .foreach(c => {
-      c.entrySet()
-        .asScala
-        .foreach(e =>
-          logParameters.getOrElseUpdate(e.getKey, mutable.Set[String]()).add(e.getValue.unwrapped().toString))
-    })
-
-  logParameters.foreach(
-    e =>
-      require(
-        e._1 == "--log-opt" || e._1 == "--log-driver",
-        s"Only --log_opt and --log_driver options may be set (found ${e._1})"))
+class LogDriverLogStore(actorSystem: ActorSystem, configOpt: Option[LogDriverLogStoreConfig] = None) extends LogStore {
+  val config =
+    configOpt.getOrElse(
+      loadConfigOrThrow[ConsumerlessLogDriverLogStoreConfig](actorSystem.settings.config, "whisk.logstore.log-driver"))
+  val logDriverMessage = config.message
+  val logParameters =
+    Map[String, Set[String]]("--log-driver" -> Set(config.dockerLogDriver)) ++
+      Map[String, Set[String]]("--log-opt" -> config.dockerLogDriverOpts)
 
   override def containerParameters = logParameters.map(kv => (kv._1, kv._2.toSet)).toMap
   def collectLogs(transid: TransactionId, container: Container, action: ExecutableWhiskAction): Future[ActivationLogs] =
