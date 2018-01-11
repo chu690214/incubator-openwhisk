@@ -128,7 +128,7 @@ class SplunkLogStore(
                 .map(msgJsValue => {
                   msgJsValue.asJsObject.fields(config.logMessageField).asInstanceOf[JsString].value
                 })
-              new ActivationLogs(messages)
+              ActivationLogs(messages)
             } else {
               throw new RuntimeException(s"failed to read logs from splunk ${response}")
             }

@@ -33,7 +33,7 @@ class LogDriverLogStoreTests extends TestKit(ActorSystem("LogDriverLogStore")) w
   behavior of "LogDriver LogStore"
 
   it should "fail when loading out of box configs (because whisk.logstore doesn't exist)" in {
-    assertThrows[ConfigReaderException[_]] {
+    a[ConfigReaderException[LogDriverLogStoreConfig]] should be thrownBy new LogDriverLogStore(system) {
       val logDriverLogStore = new LogDriverLogStore(system)
     }
 

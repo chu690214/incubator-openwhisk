@@ -18,19 +18,13 @@
 package whisk.core.containerpool.logging
 
 import akka.actor.ActorSystem
-//import com.typesafe.config.ConfigObject
-//import com.typesafe.config.ConfigList
-//import com.typesafe.config.ConfigObject
+import whisk.core.entity.Identity
 import pureconfig.loadConfigOrThrow
-//import scala.collection.JavaConverters._
-//import scala.collection.mutable
-import scala.concurrent.Future
 import whisk.common.TransactionId
 import whisk.core.containerpool.Container
-import whisk.core.entity.ActivationLogs
-import whisk.core.entity.ExecutableWhiskAction
-import whisk.core.entity.WhiskActivation
-import pureconfig._
+import whisk.core.entity.{ActivationLogs, ExecutableWhiskAction, WhiskActivation}
+
+import scala.concurrent.Future
 
 trait LogDriverLogStoreConfig {
   def message: String
@@ -52,12 +46,15 @@ class LogDriverLogStore(actorSystem: ActorSystem,
                           loadConfigOrThrow[ConsumerlessLogDriverLogStoreConfig]("whisk.logstore.log-driver"))
     extends LogStore {
   val logDriverMessage = config.message
-  val logParameters =
-    Map[String, Set[String]]("--log-driver" -> Set(config.dockerLogDriver)) ++
-      Map[String, Set[String]]("--log-opt" -> config.dockerLogDriverOpts)
+  val logParameters = Map("--log-driver" -> Set(config.dockerLogDriver), "--log-opt" -> config.dockerLogDriverOpts)
 
   override def containerParameters = logParameters.map(kv => (kv._1, kv._2.toSet)).toMap
-  def collectLogs(transid: TransactionId, container: Container, action: ExecutableWhiskAction): Future[ActivationLogs] =
+
+  def collectLogs(transid: TransactionId,
+                  user: Identity,
+                  activation: WhiskActivation,
+                  container: Container,
+                  action: ExecutableWhiskAction): Future[ActivationLogs] =
     Future.successful(ActivationLogs()) //no logs collected when using docker log drivers (see DockerLogStore for json-file exception)
 
   /** no logs exposed to API/CLI using only the LogDriverLogStore; use an extended version, e.g. the SplunkLogStore to expose logs from some external source */
