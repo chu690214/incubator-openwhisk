@@ -67,9 +67,6 @@ class SplunkLogStoreTests
     with Matchers
     with ScalaFutures {
   val testConfig = SplunkLogStoreConfig(
-    "logs are stored in splunk",
-    "fluentd",
-    Set("tag=OW_CONTAINER", "fluentd-address=localhost:24225"),
     "splunk-host",
     8080,
     "splunk-user",
@@ -159,7 +156,7 @@ class SplunkLogStoreTests
 
   it should "fail to connect to bogus host" in {
     //use the default http flow with the default bogus-host config
-    val splunkStore = new SplunkLogStore(system, config = testConfig)
+    val splunkStore = new SplunkLogStore(system, splunkConfig = testConfig)
     val result = splunkStore.fetchLogs(activation)
     whenReady(result.failed, Timeout(1.second)) { ex =>
       ex shouldBe an[StreamTcpException]

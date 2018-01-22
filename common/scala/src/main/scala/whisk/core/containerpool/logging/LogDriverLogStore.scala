@@ -21,34 +21,21 @@ import akka.actor.ActorSystem
 import whisk.core.entity.Identity
 import pureconfig.loadConfigOrThrow
 import whisk.common.TransactionId
-import whisk.core.containerpool.Container
+import whisk.core.containerpool.{Container, ContainerArgsConfig}
 import whisk.core.entity.{ActivationLogs, ExecutableWhiskAction, WhiskActivation}
 
 import scala.concurrent.Future
-
-trait LogDriverLogStoreConfig {
-  def message: String
-  def dockerLogDriver: String
-  def dockerLogDriverOpts: Set[String]
-}
-
-case class ConsumerlessLogDriverLogStoreConfig(message: String,
-                                               dockerLogDriver: String,
-                                               dockerLogDriverOpts: Set[String])
-    extends LogDriverLogStoreConfig
-
 /**
  * Docker log driver based LogStore impl. Uses docker log driver to emit container logs to an external store.
- * Fetching logs from that external store is not provided in this trait.
+ * Fetching logs from that external store is not provided in this trait. This SPI now requires the container
+ * args to be used as that is the place where the logs are shipped and fetching them here is a NOOP.
  */
 class LogDriverLogStore(actorSystem: ActorSystem,
-                        config: LogDriverLogStoreConfig =
-                          loadConfigOrThrow[ConsumerlessLogDriverLogStoreConfig]("whisk.logstore.log-driver"))
+                        config: ContainerArgsConfig =
+                          loadConfigOrThrow[ContainerArgsConfig]("whisk.container-factory.container-args"))
     extends LogStore {
-  val logDriverMessage = config.message
-  val logParameters = Map("--log-driver" -> Set(config.dockerLogDriver), "--log-opt" -> config.dockerLogDriverOpts)
 
-  override def containerParameters = logParameters.map(kv => (kv._1, kv._2.toSet)).toMap
+  override def containerParameters = config.extraArgs
 
   def collectLogs(transid: TransactionId,
                   user: Identity,
@@ -59,7 +46,7 @@ class LogDriverLogStore(actorSystem: ActorSystem,
 
   /** no logs exposed to API/CLI using only the LogDriverLogStore; use an extended version, e.g. the SplunkLogStore to expose logs from some external source */
   def fetchLogs(activation: WhiskActivation): Future[ActivationLogs] =
-    Future.successful(ActivationLogs(Vector(logDriverMessage)))
+    Future.successful(ActivationLogs(Vector("Sending to other thing.")))
 
 }
 object LogDriverLogStoreProvider extends LogStoreProvider {

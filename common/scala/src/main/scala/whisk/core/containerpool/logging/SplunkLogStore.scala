@@ -21,6 +21,7 @@ import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+
 import akka.http.scaladsl.client.RequestBuilding.Post
 import akka.http.scaladsl.model.FormData
 import akka.http.scaladsl.model.HttpRequest
@@ -35,7 +36,6 @@ import akka.stream.scaladsl.Flow
 import akka.stream.scaladsl.Keep
 import akka.stream.scaladsl.Sink
 import akka.stream.scaladsl.Source
-//import com.typesafe.config.ConfigObject
 import com.typesafe.sslconfig.akka.AkkaSSLConfig
 import scala.concurrent.Future
 import scala.concurrent.Promise
@@ -49,10 +49,7 @@ import whisk.core.entity.ActivationLogs
 import whisk.core.entity.WhiskActivation
 import pureconfig._
 
-case class SplunkLogStoreConfig(message: String,
-                                dockerLogDriver: String,
-                                dockerLogDriverOpts: Set[String],
-                                host: String,
+case class SplunkLogStoreConfig(host: String,
                                 port: Int,
                                 username: String,
                                 password: String,
@@ -60,7 +57,6 @@ case class SplunkLogStoreConfig(message: String,
                                 logMessageField: String,
                                 activationIdField: String,
                                 disableSNI: Boolean)
-    extends LogDriverLogStoreConfig
 
 /**
  * A Splunk based impl of LogDriverLogStore. Logs are routed to splunk via docker log driver, and retrieved via Splunk REST API
@@ -70,8 +66,8 @@ case class SplunkLogStoreConfig(message: String,
 class SplunkLogStore(
   actorSystem: ActorSystem,
   httpFlow: Option[Flow[(HttpRequest, Promise[HttpResponse]), (Try[HttpResponse], Promise[HttpResponse]), Any]] = None,
-  config: SplunkLogStoreConfig = loadConfigOrThrow[SplunkLogStoreConfig]("whisk.logstore.splunk"))
-    extends LogDriverLogStore(actorSystem, config) {
+  splunkConfig: SplunkLogStoreConfig = loadConfigOrThrow[SplunkLogStoreConfig]("whisk.logstore.splunk"))
+    extends LogDriverLogStore(actorSystem) {
   implicit val as = actorSystem
   implicit val ec = as.dispatcher
   implicit val materializer = ActorMaterializer()
@@ -82,10 +78,10 @@ class SplunkLogStore(
   val maxPendingRequests = 500
 
   val defaultHttpFlow = Http().cachedHostConnectionPoolHttps[Promise[HttpResponse]](
-    host = config.host,
-    port = config.port,
+    host = splunkConfig.host,
+    port = splunkConfig.port,
     connectionContext =
-      if (config.disableSNI)
+      if (splunkConfig.disableSNI)
         Http().createClientHttpsContext(AkkaSSLConfig().mapSettings(s => s.withLoose(s.loose.withDisableSNI(true))))
       else Http().defaultClientHttpsContext)
 
@@ -96,7 +92,7 @@ class SplunkLogStore(
     //example response:
     //    {"preview":false,"init_offset":0,"messages":[],"fields":[{"name":"log_message"}],"results":[{"log_message":"some log message"}], "highlighted":{}}
     val search =
-      s"""search index="${config.index}"| spath ${config.activationIdField} | search ${config.activationIdField}=${activation.activationId.toString} | table ${config.logMessageField}"""
+      s"""search index="${splunkConfig.index}"| spath ${splunkConfig.activationIdField} | search ${splunkConfig.activationIdField}=${activation.activationId.toString} | table ${splunkConfig.logMessageField}"""
 
     val formatter = DateTimeFormatter.ofPattern("YYYY-MM-dd'T'hh:mm:ss").withZone(ZoneId.of("UTC"))
     val entity = FormData(
@@ -111,7 +107,7 @@ class SplunkLogStore(
     queueRequest(
       Post(splunkApi)
         .withEntity(entity)
-        .withHeaders(List(Authorization(BasicHttpCredentials(config.username, config.password)))))
+        .withHeaders(List(Authorization(BasicHttpCredentials(splunkConfig.username, splunkConfig.password)))))
       .flatMap(response => {
         log.debug(s"splunk API response ${response}")
         Unmarshal(response.entity)
@@ -126,7 +122,7 @@ class SplunkLogStore(
                 .convertTo[JsArray]
                 .elements
                 .map(msgJsValue => {
-                  msgJsValue.asJsObject.fields(config.logMessageField).asInstanceOf[JsString].value
+                  msgJsValue.asJsObject.fields(splunkConfig.logMessageField).asInstanceOf[JsString].value
                 })
               ActivationLogs(messages)
             } else {
