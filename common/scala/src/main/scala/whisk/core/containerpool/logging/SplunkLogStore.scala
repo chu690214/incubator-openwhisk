@@ -60,6 +60,7 @@ case class SplunkLogStoreConfig(host: String,
 
 /**
  * A Splunk based impl of LogDriverLogStore. Logs are routed to splunk via docker log driver, and retrieved via Splunk REST API
+ *
  * @param actorSystem
  * @param httpFlow Optional Flow to use for HttpRequest handling (to enable stream based tests)
  */
@@ -92,7 +93,7 @@ class SplunkLogStore(
     //example response:
     //    {"preview":false,"init_offset":0,"messages":[],"fields":[{"name":"log_message"}],"results":[{"log_message":"some log message"}], "highlighted":{}}
     val search =
-      s"""search index="${splunkConfig.index}"| spath ${splunkConfig.activationIdField} | search ${splunkConfig.activationIdField}=${activation.activationId.toString} | table ${splunkConfig.logMessageField}"""
+      s"""search index="${splunkConfig.index}"| spath ${splunkConfig.activationIdField}| search ${splunkConfig.activationIdField}=${activation.activationId.toString}| table ${splunkConfig.logMessageField}"""
 
     val formatter = DateTimeFormatter.ofPattern("YYYY-MM-dd'T'hh:mm:ss").withZone(ZoneId.of("UTC"))
     val entity = FormData(
@@ -100,8 +101,7 @@ class SplunkLogStore(
         "exec_mode" -> "oneshot",
         "search" -> search,
         "output_mode" -> "json",
-        "earliest_time" -> formatter.format(activation.start)
-      )).toEntity
+        "earliest_time" -> formatter.format(activation.start))).toEntity
 
     log.debug("sending request")
     queueRequest(
@@ -158,6 +158,7 @@ class SplunkLogStore(
     }
   }
 }
+
 object SplunkLogStoreProvider extends LogStoreProvider {
   override def logStore(actorSystem: ActorSystem) = new SplunkLogStore(actorSystem)
 }

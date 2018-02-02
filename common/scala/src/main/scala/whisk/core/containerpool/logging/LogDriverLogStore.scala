@@ -25,6 +25,7 @@ import whisk.core.containerpool.{Container, ContainerArgsConfig}
 import whisk.core.entity.{ActivationLogs, ExecutableWhiskAction, WhiskActivation}
 
 import scala.concurrent.Future
+
 /**
  * Docker log driver based LogStore impl. Uses docker log driver to emit container logs to an external store.
  * Fetching logs from that external store is not provided in this trait. This SPI now requires the container
@@ -49,6 +50,7 @@ class LogDriverLogStore(actorSystem: ActorSystem,
     Future.successful(ActivationLogs(Vector("Sending to other thing.")))
 
 }
+
 object LogDriverLogStoreProvider extends LogStoreProvider {
   override def logStore(actorSystem: ActorSystem) = new LogDriverLogStore(actorSystem)
 }

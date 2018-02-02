@@ -26,8 +26,10 @@ import whisk.core.containerpool.ContainerArgsConfig
 
 class LogDriverLogStoreTests extends TestKit(ActorSystem("LogDriverLogStore")) with FlatSpecLike with Matchers {
 
-  val testConfig = ContainerArgsConfig(network = "network", extraArgs = Map("log-driver" -> Set("fluentd"),
-    "log-opt" -> Set("fluentd-address=localhost:24225", "tag=OW_CONTAINER")))
+  val testConfig = ContainerArgsConfig(
+    network = "network",
+    extraArgs =
+      Map("log-driver" -> Set("fluentd"), "log-opt" -> Set("fluentd-address=localhost:24225", "tag=OW_CONTAINER")))
   behavior of "LogDriver LogStore"
 
   it should "fail when loading out of box configs (because whisk.logstore doesn't exist)" in {
