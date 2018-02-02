@@ -2,9 +2,20 @@
 # Creating and invoking OpenWhisk actions
 
 
-Actions are stateless code snippets that run on the OpenWhisk platform. An action can be written as a JavaScript, Swift, or Python function, a Java method, or a custom executable program packaged in a Docker container. For example, an action can be used to detect the faces in an image, respond to a database change, aggregate a set of API calls, or post a Tweet.
+Actions are stateless code snippets that run on the OpenWhisk platform.
+For example, an action can be used to detect the faces in an image, respond to a database change,
+aggregate a set of API calls, or post a Tweet.
+An action can be written as a JavaScript, Swift, Python or PHP function, a Java method,
+any binary-compatible executable including Go programs and custom executables packaged as Docker containers.
 
-Actions can be explicitly invoked, or run in response to an event. In either case, each run of an action results in an activation record that is identified by a unique activation ID. The input to an action and the result of an action are a dictionary of key-value pairs, where the key is a string and the value a valid JSON value. Actions can also be composed of calls to other actions or a defined sequence of actions.
+Actions can be explicitly invoked, or run in response to an event.
+In either case, each run of an action results in an activation record that is identified by a unique activation ID.
+The input to an action and the result of an action are a dictionary of key-value pairs, where the key is a string and the value a valid JSON value.
+Actions can also be composed of calls to other actions or a defined sequence of actions.
+
+## Prerequisites
+
+You will need to use OpenWhisk CLI. Read how to use it when running OpenWhisk from a VM [here](https://github.com/apache/incubator-openwhisk/blob/master/tools/vagrant/README.md#using-cli-from-outside-the-vm). Or download binaries for your platform [here](https://github.com/apache/incubator-openwhisk-cli/releases). You can also download the CLI directly from your local installation at the _https://<IP_ADDRESS>/cli/go/download/_ path.
 
 Learn how to create, invoke, and debug actions in your preferred development environment:
 
@@ -14,6 +25,8 @@ Learn how to create, invoke, and debug actions in your preferred development env
 * [Java](#creating-java-actions)
 * [PHP](#creating-php-actions)
 * [Docker](#creating-docker-actions)
+* [Go](#creating-go-actions)
+* [Native binaries](#creating-native-actions)
 
 In addition, learn about:
 
@@ -50,6 +63,7 @@ Review the following steps and examples to create your first JavaScript action.
   ```
   ok: created action hello
   ```
+  The CLI automatically infers the type of the action by using the source file extension. For `.js` source files, the action runs by using a Node.js 6 runtime. You can also create an action that runs with Node.js 8 by explicitly specifying the parameter `--kind nodejs:8`. For more information, see the Node.js 6 vs 8 [reference](./openwhisk_reference.html#openwhisk_ref_javascript_environments).
 
 3. List the actions that you have created:
 
@@ -258,7 +272,7 @@ Rather than pass all the parameters to an action every time, you can bind certai
   ```json
   {
     "name": "Bernie",
-    "place": "Vermont"
+    "place": "Washington, DC"
   }
   ```
 
@@ -474,7 +488,7 @@ To create an OpenWhisk action from this package:
   wsk action create packageAction --kind nodejs:6 action.zip
   ```
 
-  Note that when creating an action from a `.zip` archive using the CLI tool, you must explicitly provide a value for the `--kind` flag.
+  When creating an action from a `.zip` archive with the CLI tool, you must explicitly provide a value for the `--kind` flag by using `nodejs:6` or `nodejs:8`.
 
 4. You can invoke the action like any other:
 
@@ -492,6 +506,90 @@ To create an OpenWhisk action from this package:
   ```
 
 Finally, note that while most `npm` packages install JavaScript sources on `npm install`, some also install and compile binary artifacts. The archive file upload currently does not support binary dependencies but rather only JavaScript dependencies. Action invocations may fail if the archive includes binary dependencies.
+
+### Package an action as a single bundle
+
+It is convenient to only include the minimal code into a single `.js` file that includes dependencies. This approach allows for faster deployments, and in some circumstances where packaging the action as a zip might be too large because it includes unnecessary files.
+
+You can use a JavaScript module bundler such as [webpack](https://webpack.js.org/concepts/). When webpack processes your code, it recursively builds a dependency graph that includes every module that your action needs.
+
+Here is a quick example using webpack:
+
+Taking the previous example `package.json` add `webpack` as a development depency and add some npm script commands.
+```json
+{
+  "name": "my-action",
+  "main": "dist/bundle.js",
+  "scripts": {
+    "build": "webpack --config webpack.config.js",
+    "deploy": "wsk action update my-action dist/bundle.js --kind nodejs:8"
+  },
+  "dependencies": {
+    "left-pad": "1.1.3"
+  },
+  "devDependencies": {
+    "webpack": "^3.8.1"
+  }
+}
+```
+
+Create the webpack configuration file `webpack.config.js`.
+```javascript
+var path = require('path');
+module.exports = {
+  entry: './index.js',
+  output: {
+    path: path.resolve(__dirname, 'dist'),
+    filename: 'bundle.js'
+  },
+  target: 'node'
+};
+```
+
+Set the variable `global.main` to the main function of the action.
+From the previous example:
+```javascript
+function myAction(args) {
+    const leftPad = require("left-pad")
+    const lines = args.lines || [];
+    return { padded: lines.map(l => leftPad(l, 30, ".")) }
+}
+global.main = myAction;
+```
+
+If your function name is `main`, use this syntax instead:
+```javascript
+global.main = main;
+```
+
+To build and deploy an OpenWhisk Action using `npm` and `webpack`:
+
+1. First, install dependencies locally:
+
+  ```
+  npm install
+  ```
+
+2. Build the webpack bundle:
+
+  ```
+  npm run build
+  ```
+
+  The file `dist/bundle.js` is created, and is used to deploy as the Action source code.
+
+3. Create the Action using the `npm` script or the CLI.
+  Using `npm` script:
+  ```
+  npm run deploy
+  ```
+  {: pre}
+  Using the CLI:
+  ```
+  wsk action update my-action dist/bundle.js
+  ```
+
+Finally, the bundle file that is built by `webpack` doesn't support binary dependencies but rather JavaScript dependencies. So Action invocations will fail if the bundle depends on binary dependencies, because this is not included with the file `bundle.js`.
 
 ## Creating action sequences
 
@@ -620,8 +718,8 @@ Below is an example scenario for installing dependencies, packaging them in a vi
 
 1. Given a `requirements.txt` file that contains the `pip` modules and versions to install, run the following to install the dependencies and create a virtualenv using a compatible Docker image:
  ```bash
- docker run --rm -v "$PWD:/tmp" openwhisk/python3action sh \
-   -c "cd tmp; virtualenv virtualenv; source virtualenv/bin/activate; pip install -r requirements.txt;"
+ docker run --rm -v "$PWD:/tmp" openwhisk/python3action bash \
+   -c "cd tmp && virtualenv virtualenv && source virtualenv/bin/activate && pip install -r requirements.txt"
  ```
 
 2. Archive the virtualenv directory and any additional Python files:
@@ -725,9 +823,7 @@ follows:
 wsk action create helloSwift hello.swift
 ```
 
-The CLI automatically infers the type of the action from the source file extension. For `.swift` source files, the action runs using a Swift 3.1.1 runtime. You can also create an action that runs with Swift 3.0 by explicitly specifying the parameter `--kind swift:3`. See the Swift [reference](./reference.md#swift-actions) for more information about Swift 3.0 vs. 3.1.
-
-**Note:** The actions you created using the kind `swift:3` will continue to work for a short period, however you should begin migrating your deployment scripts and recompiling your swift actions using the new kind `swift:3.1.1`. Support for Swift 3.0 is deprecated and will be removed soon.
+The CLI automatically infers the type of the action from the source file extension. For `.swift` source files, the action runs using a Swift 3.1.1 runtime. See the Swift [reference](./reference.md#swift-actions) for more information about the Swift runtime.
 
 
 Action invocation is the same for Swift actions as it is for JavaScript actions:
@@ -1019,6 +1115,70 @@ For the instructions that follow, assume that the Docker user ID is `janesmith` 
   ```bash
   wsk action create example exec.zip --docker openwhisk/dockerskeleton
   ```
+
+## Creating Go actions
+
+The `--native` option allows for packaging of any executable as an action. This works for Go as an example.
+As with Docker actions, the Go executable receives a single argument from the command line.
+It is a string serialization of the JSON object representing the arguments to the action.
+The program may log to `stdout` or `stderr`.
+By convention, the last line of output _must_ be a stringified JSON object which represents the result of the action.
+
+Here is an example Go action.
+```go
+package main
+
+import "encoding/json"
+import "fmt"
+import "os"
+
+func main() {
+    //program receives one argument: the JSON object as a string
+    arg := os.Args[1]
+   
+    // unmarshal the string to a JSON object
+    var obj map[string]interface{}
+    json.Unmarshal([]byte(arg), &obj)
+
+    // can optionally log to stdout (or stderr)
+    fmt.Println("hello Go action")
+
+    name, ok := obj["name"].(string)
+    if !ok { name = "Stranger" }
+
+    // last line of stdout is the result JSON object as a string
+    msg := map[string]string{"msg": ("Hello, " + name + "!")}
+    res, _ := json.Marshal(msg)
+    fmt.Println(string(res))
+}
+```
+
+Save the code above to a file `sample.go` and cross compile it for OpenWhisk. The executable must be called `exec`.
+```bash
+GOOS=linux GOARCH=amd64 go build -o exec
+zip exec.zip exec
+wsk action create helloGo --native exec.zip
+```
+
+The action may be run as any other action.
+```bash
+wsk action invoke helloGo -r -p name gopher
+{
+    "msg": "Hello, gopher!"
+}
+```
+
+Logs are retrieved in a similar way as well.
+```bash
+wsk activation logs --last --strip
+my first Go action.
+```
+
+## Creating native actions
+
+Using `--native`, you can see that any executable may be run as an OpenWhisk action. This includes `bash` scripts,
+or cross compiled binaries. For the latter, the constraint is that the binary must be compatible with the
+`openwhisk/dockerskeleton` image.
 
 ## Watching action output
 

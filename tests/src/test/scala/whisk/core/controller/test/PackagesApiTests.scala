@@ -18,19 +18,16 @@
 package whisk.core.controller.test
 
 import scala.language.postfixOps
-
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
-
 import akka.http.scaladsl.model.StatusCodes._
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import akka.http.scaladsl.server.Route
-
 import spray.json.DefaultJsonProtocol._
 import spray.json._
-
 import whisk.core.entity._
 import whisk.core.controller.WhiskPackagesApi
+import whisk.core.entitlement.Collection
 import whisk.http.ErrorResponse
 import whisk.http.Messages
 
@@ -40,7 +37,6 @@ import whisk.http.Messages
  * Unit tests of the controller service as a standalone component.
  * These tests exercise a fresh instance of the service object in memory -- these
  * tests do NOT communication with a whisk deployment.
- *
  *
  * @Idioglossia
  * "using Specification DSL to write unit tests, as in should, must, not, be"
@@ -62,6 +58,18 @@ class PackagesApiTests extends ControllerTestCommon with WhiskPackagesApi {
     Parameters(WhiskPackage.bindingFieldName, Binding.serdes.write(binding))
   }
 
+  def checkCount(path: String = collectionPath, expected: Long, user: Identity = creds) = {
+    implicit val tid = transid()
+    withClue(s"count did not match") {
+      whisk.utils.retry {
+        Get(s"$path?count=true") ~> Route.seal(routes(user)) ~> check {
+          status should be(OK)
+          responseAs[JsObject].fields(collection.path).convertTo[Long] shouldBe (expected)
+        }
+      }
+    }
+  }
+
   //// GET /packages
   it should "list all packages/references" in {
     implicit val tid = transid()
@@ -76,21 +84,25 @@ class PackagesApiTests extends ControllerTestCommon with WhiskPackagesApi {
     }.toList
     providers foreach { put(entityStore, _) }
     waitOnView(entityStore, WhiskPackage, namespace, providers.length)
+
+    checkCount(expected = providers.length)
     whisk.utils.retry {
       Get(s"$collectionPath") ~> Route.seal(routes(creds)) ~> check {
         status should be(OK)
         val response = responseAs[List[JsObject]]
         providers.length should be(response.length)
-        providers forall { p =>
-          response contains p.summaryAsJson
-        } should be(true)
+        response should contain theSameElementsAs providers.map(_.summaryAsJson)
       }
     }
 
-    val auser = WhiskAuthHelpers.newIdentity()
-    Get(s"/$namespace/${collection.path}") ~> Route.seal(routes(auser)) ~> check {
-      val response = responseAs[List[JsObject]]
-      response should be(List()) // cannot list packages that are private in another namespace
+    {
+      val path = s"/$namespace/${collection.path}"
+      val auser = WhiskAuthHelpers.newIdentity()
+      checkCount(path, 0, auser)
+      Get(path) ~> Route.seal(routes(auser)) ~> check {
+        val response = responseAs[List[JsObject]]
+        response should be(List()) // cannot list packages that are private in another namespace
+      }
     }
   }
 
@@ -111,29 +123,42 @@ class PackagesApiTests extends ControllerTestCommon with WhiskPackagesApi {
     waitOnView(entityStore, WhiskPackage, namespaces(1), 1)
     waitOnView(entityStore, WhiskPackage, namespaces(2), 1)
     waitOnView(entityStore, WhiskPackage, namespaces(0), 1 + 4)
-    Get(s"$collectionPath") ~> Route.seal(routes(creds)) ~> check {
-      status should be(OK)
-      val response = responseAs[List[JsObject]]
-      val expected = providers.filter { _.namespace == namespace } ++ references
-      response.length should be >= (expected.length)
-      expected forall { p =>
-        (response contains p.summaryAsJson)
-      } should be(true)
+
+    {
+      val expected = providers.filter(_.namespace == namespace) ++ references
+      checkCount(expected = expected.length)
+      Get(s"$collectionPath") ~> Route.seal(routes(creds)) ~> check {
+        status should be(OK)
+        val response = responseAs[List[JsObject]]
+        response should have size expected.size
+        response should contain theSameElementsAs expected.map(_.summaryAsJson)
+      }
     }
 
-    val auser = WhiskAuthHelpers.newIdentity()
-    Get(s"/$namespace/${collection.path}") ~> Route.seal(routes(auser)) ~> check {
-      status should be(OK)
-      val response = responseAs[List[JsObject]]
-      val expected = providers.filter { p =>
-        p.namespace == namespace && p.publish
-      } ++ references.filter { p =>
-        p.publish && p.binding == None
+    {
+      val path = s"/$namespace/${collection.path}"
+      val auser = WhiskAuthHelpers.newIdentity()
+      val expected = providers.filter(p => p.namespace == namespace && p.publish) ++
+        references.filter(p => p.publish && p.binding == None)
+
+      checkCount(path, expected.length, auser)
+      Get(path) ~> Route.seal(routes(auser)) ~> check {
+        status should be(OK)
+        val response = responseAs[List[JsObject]]
+        response should have size expected.size
+        response should contain theSameElementsAs expected.map(_.summaryAsJson)
       }
-      response.length should be >= (expected.length)
-      expected forall { p =>
-        (response contains p.summaryAsJson)
-      } should be(true)
+    }
+  }
+
+  it should "reject list when limit is greater than maximum allowed value" in {
+    implicit val tid = transid()
+    val exceededMaxLimit = Collection.MAX_LIST_LIMIT + 1
+    val response = Get(s"$collectionPath?limit=$exceededMaxLimit") ~> Route.seal(routes(creds)) ~> check {
+      status should be(BadRequest)
+      responseAs[String] should include {
+        Messages.maxListLimitExceeded(Collection.PACKAGES, exceededMaxLimit, Collection.MAX_LIST_LIMIT)
+      }
     }
   }
 
@@ -206,10 +231,11 @@ class PackagesApiTests extends ControllerTestCommon with WhiskPackagesApi {
       waitOnView(entityStore, WhiskPackage, namespaces(0), 1)
       waitOnView(entityStore, WhiskPackage, namespaces(1), 1)
       waitOnView(entityStore, WhiskPackage, namespaces(2), 1)
+      val expected = providers filter (_.namespace == creds.namespace.toPath)
+
       Get(s"$collectionPath?public=true") ~> Route.seal(routes(creds)) ~> check {
         status should be(OK)
         val response = responseAs[List[JsObject]]
-        val expected = providers filter { _.namespace == creds.namespace.toPath }
         response.length should be >= (expected.length)
         expected forall { p =>
           (response contains p.summaryAsJson) && p.binding == None
@@ -367,6 +393,49 @@ class PackagesApiTests extends ControllerTestCommon with WhiskPackagesApi {
       status should be(OK)
       val response = responseAs[WhiskPackage]
       response should be(provider)
+    }
+  }
+
+  it should "reject create/update package when package name is reserved" in {
+    implicit val tid = transid()
+    Set(true, false) foreach { overwrite =>
+      RESERVED_NAMES foreach { reservedName =>
+        val provider = WhiskPackage(namespace, EntityName(reservedName), None)
+        val content = WhiskPackagePut()
+        Put(s"$collectionPath/${provider.name}?overwrite=$overwrite", content) ~> Route.seal(routes(creds)) ~> check {
+          status should be(BadRequest)
+          responseAs[ErrorResponse].error shouldBe Messages.packageNameIsReserved(reservedName)
+        }
+      }
+    }
+  }
+
+  it should "not allow package update of pre-existing package with a reserved" in {
+    implicit val tid = transid()
+    RESERVED_NAMES foreach { reservedName =>
+      val provider = WhiskPackage(namespace, EntityName(reservedName), None)
+      put(entityStore, provider)
+      val content = WhiskPackagePut()
+      Put(s"$collectionPath/${provider.name}?overwrite=true", content) ~> Route.seal(routes(creds)) ~> check {
+        status should be(BadRequest)
+        responseAs[ErrorResponse].error shouldBe Messages.packageNameIsReserved(reservedName)
+      }
+    }
+  }
+
+  it should "allow package get/delete for pre-existing package with a reserved name" in {
+    implicit val tid = transid()
+    RESERVED_NAMES foreach { reservedName =>
+      val provider = WhiskPackage(namespace, EntityName(reservedName), None)
+      put(entityStore, provider, garbageCollect = false)
+      val content = WhiskPackagePut()
+      Get(s"$collectionPath/${provider.name}") ~> Route.seal(routes(creds)) ~> check {
+        status should be(OK)
+        responseAs[WhiskPackage] shouldBe provider
+      }
+      Delete(s"$collectionPath/${provider.name}") ~> Route.seal(routes(creds)) ~> check {
+        status should be(OK)
+      }
     }
   }
 

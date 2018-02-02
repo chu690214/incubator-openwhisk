@@ -29,14 +29,17 @@ import org.apache.kafka.clients.producer.KafkaProducer
 import org.apache.kafka.clients.producer.ProducerConfig
 import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.clients.producer.RecordMetadata
+import org.apache.kafka.common.errors.NotLeaderForPartitionException
 import org.apache.kafka.common.serialization.StringSerializer
 import whisk.common.Counter
 import whisk.common.Logging
 import whisk.core.connector.Message
 import whisk.core.connector.MessageProducer
 import whisk.core.entity.UUIDs
+import pureconfig._
+import whisk.core.ConfigKeys
 
-class KafkaProducerConnector(kafkahost: String,
+class KafkaProducerConnector(kafkahosts: String,
                              implicit val executionContext: ExecutionContext,
                              id: String = UUIDs.randomUUID().toString)(implicit logging: Logging)
     extends MessageProducer {
@@ -44,12 +47,11 @@ class KafkaProducerConnector(kafkahost: String,
   override def sentCount() = sentCounter.cur
 
   /** Sends msg to topic. This is an asynchronous operation. */
-  override def send(topic: String, msg: Message): Future[RecordMetadata] = {
+  override def send(topic: String, msg: Message, retry: Int = 2): Future[RecordMetadata] = {
     implicit val transid = msg.transid
     val record = new ProducerRecord[String, String](topic, "messages", msg.serialize)
-
-    logging.debug(this, s"sending to topic '$topic' msg '$msg'")
     val produced = Promise[RecordMetadata]()
+
     producer.send(record, new Callback {
       override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
         if (exception == null) produced.success(metadata)
@@ -63,6 +65,13 @@ class KafkaProducerConnector(kafkahost: String,
         sentCounter.next()
       case Failure(t) =>
         logging.error(this, s"sending message on topic '$topic' failed: ${t.getMessage}")
+    } recoverWith {
+      case t: NotLeaderForPartitionException =>
+        if (retry > 0) {
+          logging.error(this, s"NotLeaderForPartitionException is retryable, remain $retry retry")
+          Thread.sleep(100)
+          send(topic, msg, retry - 1)
+        } else produced.future
     }
   }
 
@@ -76,8 +85,12 @@ class KafkaProducerConnector(kafkahost: String,
 
   private def getProps: Properties = {
     val props = new Properties
-    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkahost)
-    props.put(ProducerConfig.ACKS_CONFIG, 1.toString)
+    props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkahosts)
+
+    // Load additional config from the config files and add them here.
+    val config =
+      KafkaConfiguration.configMapToKafkaConfig(loadConfigOrThrow[Map[String, String]](ConfigKeys.kafkaProducer))
+    config.foreach { case (key, value) => props.put(key, value) }
     props
   }
 

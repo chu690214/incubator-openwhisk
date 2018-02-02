@@ -29,27 +29,26 @@ import akka.http.scaladsl.model.Uri
 import akka.http.scaladsl.server.Route
 import akka.stream.ActorMaterializer
 import spray.json._
-
 import spray.json.DefaultJsonProtocol._
-
 import kamon.Kamon
-
 import whisk.common.AkkaLogging
 import whisk.common.Logging
 import whisk.common.LoggingMarkers
 import whisk.common.TransactionId
 import whisk.core.WhiskConfig
+import whisk.core.connector.MessagingProvider
 import whisk.core.database.RemoteCacheInvalidation
 import whisk.core.database.CacheChangeNotification
 import whisk.core.entitlement._
 import whisk.core.entity._
 import whisk.core.entity.ActivationId.ActivationIdGenerator
 import whisk.core.entity.ExecManifest.Runtimes
-import whisk.core.loadBalancer.{LoadBalancerService}
+import whisk.core.loadBalancer.LoadBalancerProvider
 import whisk.http.BasicHttpService
 import whisk.http.BasicRasService
 import whisk.spi.SpiLoader
 import whisk.core.containerpool.logging.LogStoreProvider
+import akka.event.Logging.InfoLevel
 
 /**
  * The Controller is the service that provides the REST API for OpenWhisk.
@@ -82,13 +81,13 @@ class Controller(val instance: InstanceId,
                  implicit val logging: Logging)
     extends BasicRasService {
 
-  override val numberOfInstances = whiskConfig.controllerInstances.toInt
   override val instanceOrdinal = instance.toInt
 
   TransactionId.controller.mark(
     this,
     LoggingMarkers.CONTROLLER_STARTUP(instance.toInt),
-    s"starting controller instance ${instance.toInt}")
+    s"starting controller instance ${instance.toInt}",
+    logLevel = InfoLevel)
 
   /**
    * A Route in Akka is technically a function taking a RequestContext as a parameter.
@@ -110,11 +109,15 @@ class Controller(val instance: InstanceId,
   private implicit val activationStore = WhiskActivationStore.datastore(whiskConfig)
   private implicit val cacheChangeNotification = Some(new CacheChangeNotification {
     val remoteCacheInvalidaton = new RemoteCacheInvalidation(whiskConfig, "controller", instance)
-    override def apply(k: CacheKey) = remoteCacheInvalidaton.notifyOtherInstancesAboutInvalidation(k)
+    override def apply(k: CacheKey) = {
+      remoteCacheInvalidaton.invalidateWhiskActionMetaData(k)
+      remoteCacheInvalidaton.notifyOtherInstancesAboutInvalidation(k)
+    }
   })
 
   // initialize backend services
-  private implicit val loadBalancer = new LoadBalancerService(whiskConfig, instance, entityStore)
+  private implicit val loadBalancer =
+    SpiLoader.get[LoadBalancerProvider].loadBalancer(whiskConfig, instance)
   private implicit val entitlementProvider = new LocalEntitlementProvider(whiskConfig, loadBalancer)
   private implicit val activationIdFactory = new ActivationIdGenerator {}
   private implicit val logStore = SpiLoader.get[LogStoreProvider].logStore(actorSystem)
@@ -134,12 +137,13 @@ class Controller(val instance: InstanceId,
    */
   private val internalInvokerHealth = {
     implicit val executionContext = actorSystem.dispatcher
-
     (path("invokers") & get) {
       complete {
-        loadBalancer.allInvokers.map(_.map {
-          case (instance, state) => s"invoker${instance.toInt}" -> state.asString
-        }.toMap.toJson.asJsObject)
+        loadBalancer
+          .invokerHealth()
+          .map(_.map {
+            case i => s"invoker${i.id.toInt}" -> i.status.asString
+          }.toMap.toJson.asJsObject)
       }
     }
   }
@@ -160,7 +164,7 @@ object Controller {
     Map(WhiskConfig.controllerInstances -> null) ++
       ExecManifest.requiredProperties ++
       RestApiCommons.requiredProperties ++
-      LoadBalancerService.requiredProperties ++
+      SpiLoader.get[LoadBalancerProvider].requiredProperties ++
       EntitlementProvider.requiredProperties
 
   private def info(config: WhiskConfig, runtimes: Runtimes, apis: List[String]) =
@@ -196,15 +200,26 @@ object Controller {
     require(args.length >= 1, "controller instance required")
     val instance = args(0).toInt
 
-    def abort() = {
-      logger.error(this, "Bad configuration, cannot start.")
+    def abort(message: String) = {
+      logger.error(this, message)
       actorSystem.terminate()
       Await.result(actorSystem.whenTerminated, 30.seconds)
       sys.exit(1)
     }
 
     if (!config.isValid) {
-      abort()
+      abort("Bad configuration, cannot start.")
+    }
+
+    val msgProvider = SpiLoader.get[MessagingProvider]
+    if (!msgProvider.ensureTopic(config, topic = "completed" + instance, topicConfig = "completed")) {
+      abort(s"failure during msgProvider.ensureTopic for topic completed$instance")
+    }
+    if (!msgProvider.ensureTopic(config, topic = "health", topicConfig = "health")) {
+      abort(s"failure during msgProvider.ensureTopic for topic health")
+    }
+    if (!msgProvider.ensureTopic(config, topic = "cacheInvalidation", topicConfig = "cache-invalidation")) {
+      abort(s"failure during msgProvider.ensureTopic for topic cacheInvalidation")
     }
 
     ExecManifest.initialize(config) match {
@@ -219,8 +234,7 @@ object Controller {
         BasicHttpService.startService(controller.route, port)(actorSystem, controller.materializer)
 
       case Failure(t) =>
-        logger.error(this, s"Invalid runtimes manifest: $t")
-        abort()
+        abort(s"Invalid runtimes manifest: $t")
     }
   }
 }

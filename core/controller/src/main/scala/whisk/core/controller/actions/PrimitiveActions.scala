@@ -17,13 +17,11 @@
 
 package whisk.core.controller.actions
 
-import scala.collection.mutable.Buffer
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.concurrent.Promise
 import scala.concurrent.duration._
 import scala.util.Failure
-
 import akka.actor.Actor
 import akka.actor.ActorRef
 import akka.actor.ActorSystem
@@ -41,6 +39,7 @@ import whisk.core.entity._
 import whisk.core.entity.types.ActivationStore
 import whisk.core.entity.types.EntityStore
 import whisk.utils.ExecutionContextFactory.FutureExtensions
+import akka.event.Logging.InfoLevel
 
 protected[actions] trait PrimitiveActions {
   /** The core collections require backend services to be injected in this trait. */
@@ -93,7 +92,7 @@ protected[actions] trait PrimitiveActions {
    */
   protected[actions] def invokeSingleAction(
     user: Identity,
-    action: ExecutableWhiskAction,
+    action: ExecutableWhiskActionMetaData,
     payload: Option[JsObject],
     waitForResponse: Option[FiniteDuration],
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]] = {
@@ -106,7 +105,6 @@ protected[actions] trait PrimitiveActions {
       action.rev,
       user,
       activationIdFactory.make(), // activation id created here
-      activationNamespace = user.namespace.toPath,
       activeAckTopicIndex,
       waitForResponse.isDefined,
       args,
@@ -116,7 +114,8 @@ protected[actions] trait PrimitiveActions {
       this,
       waitForResponse
         .map(_ => LoggingMarkers.CONTROLLER_ACTIVATION_BLOCKING)
-        .getOrElse(LoggingMarkers.CONTROLLER_ACTIVATION))
+        .getOrElse(LoggingMarkers.CONTROLLER_ACTIVATION),
+      logLevel = InfoLevel)
     val startLoadbalancer =
       transid.started(this, LoggingMarkers.CONTROLLER_LOADBALANCER, s"action activation id: ${message.activationId}")
     val postedFuture = loadBalancer.publish(action, message)
@@ -160,12 +159,12 @@ protected[actions] trait PrimitiveActions {
     // 2. failing active ack (due to active ack timeout), fall over to db polling
     // 3. timeout on db polling => converts activation to non-blocking (returns activation id only)
     // 4. internal error message
-    val docid = DocId(WhiskEntity.qualifiedName(user.namespace.toPath, activationId))
+    val docid = new DocId(WhiskEntity.qualifiedName(user.namespace.toPath, activationId))
     val (promise, finisher) = ActivationFinisher.props({ () =>
       WhiskActivation.get(activationStore, docid)
     })
 
-    logging.info(this, s"action activation will block for result upto $totalWaitTime")
+    logging.debug(this, s"action activation will block for result upto $totalWaitTime")
 
     activeAckResponse map {
       case result @ Right(_) =>
@@ -258,7 +257,7 @@ protected[actions] object ActivationFinisher {
     // when the future completes, self-destruct
     promise.future.andThen { case _ => shutdown() }
 
-    val preemptiveMsgs: Buffer[Cancellable] = Buffer.empty
+    var preemptiveMsgs = Vector.empty[Cancellable]
 
     def receive = {
       case ActivationFinisher.Finish(activation) =>
@@ -267,21 +266,21 @@ protected[actions] object ActivationFinisher {
       case msg @ Scheduler.WorkOnceNow =>
         // try up to three times when pre-emptying the schedule
         fastPollPeriods.foreach { s =>
-          preemptiveMsgs += context.system.scheduler.scheduleOnce(s, poller, msg)
+          preemptiveMsgs = preemptiveMsgs :+ context.system.scheduler.scheduleOnce(s, poller, msg)
         }
     }
 
     def shutdown(): Unit = {
       preemptiveMsgs.foreach(_.cancel())
-      preemptiveMsgs.clear()
+      preemptiveMsgs = Vector.empty
       context.stop(poller)
       context.stop(self)
     }
 
     override def postStop() = {
-      logging.info(this, "finisher shutdown")
+      logging.debug(this, "finisher shutdown")
       preemptiveMsgs.foreach(_.cancel())
-      preemptiveMsgs.clear()
+      preemptiveMsgs = Vector.empty
       context.stop(poller)
     }
   }

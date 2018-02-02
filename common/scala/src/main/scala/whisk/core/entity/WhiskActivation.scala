@@ -23,12 +23,14 @@ import scala.concurrent.Future
 import scala.util.Try
 
 import spray.json._
-import spray.json.DefaultJsonProtocol
 import spray.json.DefaultJsonProtocol._
 import whisk.common.TransactionId
+import whisk.core.ConfigKeys
 import whisk.core.database.ArtifactStore
 import whisk.core.database.DocumentFactory
 import whisk.core.database.StaleParameter
+
+import pureconfig._
 
 /**
  * A WhiskActivation provides an abstraction of the meta-data
@@ -66,7 +68,7 @@ case class WhiskActivation(namespace: EntityPath,
                            publish: Boolean = false,
                            annotations: Parameters = Parameters(),
                            duration: Option[Long] = None)
-    extends WhiskEntity(EntityName(activationId.asString)) {
+    extends WhiskEntity(EntityName(activationId.asString), "activation") {
 
   require(cause != null, "cause undefined")
   require(start != null, "start undefined")
@@ -75,10 +77,28 @@ case class WhiskActivation(namespace: EntityPath,
 
   def toJson = WhiskActivation.serdes.write(this).asJsObject
 
-  /** This the activation summary as computed by the database view. Strictly used for testing. */
+  /**
+   * This the activation summary as computed by the database view.
+   * Strictly used in view testing to enforce alignment.
+   */
   override def summaryAsJson = {
-    val JsObject(fields) = super.summaryAsJson
-    JsObject(fields + ("activationId" -> activationId.toJson))
+    import WhiskActivation.instantSerdes
+
+    def actionOrNot() = {
+      if (end != Instant.EPOCH) {
+        Map(
+          "end" -> end.toJson,
+          "duration" -> (duration getOrElse (end.toEpochMilli - start.toEpochMilli)).toJson,
+          "statusCode" -> response.statusCode.toJson)
+      } else Map.empty
+    }
+
+    JsObject(
+      super.summaryAsJson.fields - "updated" +
+        ("activationId" -> activationId.toJson) +
+        ("start" -> start.toJson) ++
+        cause.map(("cause" -> _.toJson)) ++
+        actionOrNot())
   }
 
   def resultAsJson = response.result.toJson.asJsObject
@@ -94,8 +114,10 @@ case class WhiskActivation(namespace: EntityPath,
     }
   }
 
-  def withoutLogsOrResult =
+  def withoutLogsOrResult = {
     copy(response = response.withoutResult, logs = ActivationLogs()).revision[WhiskActivation](rev)
+  }
+
   def withoutLogs = copy(logs = ActivationLogs()).revision[WhiskActivation](rev)
   def withLogs(logs: ActivationLogs) = copy(logs = logs).revision[WhiskActivation](rev)
 }
@@ -105,7 +127,16 @@ object WhiskActivation
     with WhiskEntityQueries[WhiskActivation]
     with DefaultJsonProtocol {
 
-  private implicit val instantSerdes = new RootJsonFormat[Instant] {
+  /** Some field names for annotations */
+  val pathAnnotation = "path"
+  val kindAnnotation = "kind"
+  val limitsAnnotation = "limits"
+  val topmostAnnotation = "topmost"
+  val causedByAnnotation = "causedBy"
+  val initTimeAnnotation = "initTime"
+  val waitTimeAnnotation = "waitTime"
+
+  protected[entity] implicit val instantSerdes = new RootJsonFormat[Instant] {
     def write(t: Instant) = t.toEpochMilli.toJson
 
     def read(value: JsValue) =
@@ -115,10 +146,24 @@ object WhiskActivation
           case JsNumber(i) => Instant.ofEpochMilli(i.bigDecimal.longValue)
           case _           => deserializationError("timetsamp malformed")
         }
-      } getOrElse deserializationError("timetsamp malformed 2")
+      } getOrElse deserializationError("timetsamp malformed")
   }
 
   override val collectionName = "activations"
+
+  private val dbConfig = loadConfigOrThrow[DBConfig](ConfigKeys.db)
+  private val mainDdoc = dbConfig.activationsDdoc
+  private val filtersDdoc = dbConfig.activationsFilterDdoc
+
+  /** The main view for activations, keyed by namespace, sorted by date. */
+  override lazy val view = WhiskEntityQueries.view(mainDdoc, collectionName)
+
+  /**
+   * A view for activations in a namespace additionally keyed by action name
+   * (and package name if present) sorted by date.
+   */
+  lazy val filtersView = WhiskEntityQueries.view(filtersDdoc, collectionName)
+
   override implicit val serdes = jsonFormat13(WhiskActivation.apply)
 
   // Caching activations doesn't make much sense in the common case as usually,
@@ -134,18 +179,18 @@ object WhiskActivation
    */
   def listActivationsMatchingName(db: ArtifactStore[WhiskActivation],
                                   namespace: EntityPath,
-                                  name: EntityName,
+                                  path: EntityPath,
                                   skip: Int,
                                   limit: Int,
-                                  docs: Boolean = false,
+                                  includeDocs: Boolean = false,
                                   since: Option[Instant] = None,
                                   upto: Option[Instant] = None,
                                   stale: StaleParameter = StaleParameter.No)(
     implicit transid: TransactionId): Future[Either[List[JsObject], List[WhiskActivation]]] = {
-    import WhiskEntityQueries._
-    val convert = if (docs) Some((o: JsObject) => Try { serdes.read(o) }) else None
-    val startKey = List(namespace.addPath(name).asString, since map { _.toEpochMilli } getOrElse 0)
-    val endKey = List(namespace.addPath(name).asString, upto map { _.toEpochMilli } getOrElse TOP, TOP)
-    query(db, viewname(collectionName), startKey, endKey, skip, limit, reduce = false, stale, convert)
+    import WhiskEntityQueries.TOP
+    val convert = if (includeDocs) Some((o: JsObject) => Try { serdes.read(o) }) else None
+    val startKey = List(namespace.addPath(path).asString, since map { _.toEpochMilli } getOrElse 0)
+    val endKey = List(namespace.addPath(path).asString, upto map { _.toEpochMilli } getOrElse TOP, TOP)
+    query(db, filtersView, startKey, endKey, skip, limit, reduce = false, stale, convert)
   }
 }

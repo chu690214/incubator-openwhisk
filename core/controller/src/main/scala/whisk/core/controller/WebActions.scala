@@ -449,8 +449,8 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
    * This method is factored out to allow mock testing.
    */
   protected def getAction(actionName: FullyQualifiedEntityName)(
-    implicit transid: TransactionId): Future[WhiskAction] = {
-    WhiskAction.get(entityStore, actionName.toDocId)
+    implicit transid: TransactionId): Future[WhiskActionMetaData] = {
+    WhiskActionMetaData.get(entityStore, actionName.toDocId)
   }
 
   /**
@@ -549,7 +549,7 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
   }
 
   private def extractEntityAndProcessRequest(actionOwnerIdentity: Identity,
-                                             action: WhiskAction,
+                                             action: WhiskActionMetaData,
                                              extension: MediaExtension,
                                              onBehalfOf: Option[Identity],
                                              context: Context,
@@ -597,7 +597,7 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
   }
 
   private def processRequest(actionOwnerIdentity: Identity,
-                             action: WhiskAction,
+                             action: WhiskActionMetaData,
                              responseType: MediaExtension,
                              onBehalfOf: Option[Identity],
                              context: Context,
@@ -658,7 +658,7 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
       case Success(Left(activationId)) =>
         // blocking invoke which got queued instead
         // this should not happen, instead it should be a blocking invoke timeout
-        logging.info(this, "activation waiting period expired")
+        logging.debug(this, "activation waiting period expired")
         terminate(Accepted, Messages.responseNotReady)
 
       case Failure(t: RejectRequest) => terminate(t.code, t.message)
@@ -680,10 +680,10 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
         // if the package lookup fails or the package doesn't conform to expected invariants,
         // fail the request with BadRequest so as not to leak information about the existence
         // of packages that are otherwise private
-        logging.info(this, s"package which does not exist")
+        logging.debug(this, s"package which does not exist")
         Future.failed(RejectRequest(NotFound))
       case _: NoSuchElementException =>
-        logging.warn(this, s"'$pkg' is a binding")
+        logging.debug(this, s"'$pkg' is a binding")
         Future.failed(RejectRequest(NotFound))
     }
   }
@@ -694,7 +694,7 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
    * @return future action document or NotFound rejection
    */
   private def actionLookup(actionName: FullyQualifiedEntityName)(
-    implicit transid: TransactionId): Future[WhiskAction] = {
+    implicit transid: TransactionId): Future[WhiskActionMetaData] = {
     getAction(actionName) recoverWith {
       case _: ArtifactStoreException | DeserializationException(_, _, _) =>
         Future.failed(RejectRequest(NotFound))
@@ -717,21 +717,21 @@ trait WhiskWebActionsApi extends Directives with ValidateRequestSize with PostAc
   /**
    * Checks if an action is exported (i.e., carries the required annotation).
    */
-  private def confirmExportedAction(actionLookup: Future[WhiskAction], authenticated: Boolean)(
-    implicit transid: TransactionId): Future[WhiskAction] = {
+  private def confirmExportedAction(actionLookup: Future[WhiskActionMetaData], authenticated: Boolean)(
+    implicit transid: TransactionId): Future[WhiskActionMetaData] = {
     actionLookup flatMap { action =>
       val requiresAuthenticatedUser = action.annotations.asBool("require-whisk-auth").exists(identity)
       val isExported = action.annotations.asBool("web-export").exists(identity)
 
       if ((isExported && requiresAuthenticatedUser && authenticated) ||
           (isExported && !requiresAuthenticatedUser)) {
-        logging.info(this, s"${action.fullyQualifiedName(true)} is exported")
+        logging.debug(this, s"${action.fullyQualifiedName(true)} is exported")
         Future.successful(action)
       } else if (!isExported) {
-        logging.info(this, s"${action.fullyQualifiedName(true)} not exported")
+        logging.debug(this, s"${action.fullyQualifiedName(true)} not exported")
         Future.failed(RejectRequest(NotFound))
       } else {
-        logging.info(this, s"${action.fullyQualifiedName(true)} requires authentication")
+        logging.debug(this, s"${action.fullyQualifiedName(true)} requires authentication")
         Future.failed(RejectRequest(Unauthorized))
       }
     }

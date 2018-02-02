@@ -21,7 +21,7 @@ import scala.concurrent.{Await, Future}
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.{DurationInt, FiniteDuration}
 import scala.language.postfixOps
-import org.scalatest.BeforeAndAfter
+import org.scalatest.BeforeAndAfterEach
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.FlatSpec
 import org.scalatest.Matchers
@@ -48,7 +48,7 @@ import whisk.spi.SpiLoader
 
 protected trait ControllerTestCommon
     extends FlatSpec
-    with BeforeAndAfter
+    with BeforeAndAfterEach
     with BeforeAndAfterAll
     with ScalatestRouteTest
     with Matchers
@@ -60,7 +60,6 @@ protected trait ControllerTestCommon
 
   override val instanceOrdinal = 0
   override val instance = InstanceId(instanceOrdinal)
-  override val numberOfInstances = 1
   val activeAckTopicIndex = InstanceId(instanceOrdinal)
 
   implicit val routeTestTimeout = RouteTestTimeout(90 seconds)
@@ -97,35 +96,35 @@ protected trait ControllerTestCommon
 
   def deleteAction(doc: DocId)(implicit transid: TransactionId) = {
     Await.result(WhiskAction.get(entityStore, doc) flatMap { doc =>
-      logging.info(this, s"deleting ${doc.docinfo}")
+      logging.debug(this, s"deleting ${doc.docinfo}")
       WhiskAction.del(entityStore, doc.docinfo)
     }, dbOpTimeout)
   }
 
   def deleteActivation(doc: DocId)(implicit transid: TransactionId) = {
     Await.result(WhiskActivation.get(activationStore, doc) flatMap { doc =>
-      logging.info(this, s"deleting ${doc.docinfo}")
+      logging.debug(this, s"deleting ${doc.docinfo}")
       WhiskActivation.del(activationStore, doc.docinfo)
     }, dbOpTimeout)
   }
 
   def deleteTrigger(doc: DocId)(implicit transid: TransactionId) = {
     Await.result(WhiskTrigger.get(entityStore, doc) flatMap { doc =>
-      logging.info(this, s"deleting ${doc.docinfo}")
+      logging.debug(this, s"deleting ${doc.docinfo}")
       WhiskAction.del(entityStore, doc.docinfo)
     }, dbOpTimeout)
   }
 
   def deleteRule(doc: DocId)(implicit transid: TransactionId) = {
     Await.result(WhiskRule.get(entityStore, doc) flatMap { doc =>
-      logging.info(this, s"deleting ${doc.docinfo}")
+      logging.debug(this, s"deleting ${doc.docinfo}")
       WhiskRule.del(entityStore, doc.docinfo)
     }, dbOpTimeout)
   }
 
   def deletePackage(doc: DocId)(implicit transid: TransactionId) = {
     Await.result(WhiskPackage.get(entityStore, doc) flatMap { doc =>
-      logging.info(this, s"deleting ${doc.docinfo}")
+      logging.debug(this, s"deleting ${doc.docinfo}")
       WhiskPackage.del(entityStore, doc.docinfo)
     }, dbOpTimeout)
   }
@@ -149,11 +148,11 @@ protected trait ControllerTestCommon
   val NAMESPACES = Collection(Collection.NAMESPACES)
   val PACKAGES = Collection(Collection.PACKAGES)
 
-  after {
+  override def afterEach() = {
     cleanup()
   }
 
-  override def afterAll() {
+  override def afterAll() = {
     println("Shutting down db connections");
     entityStore.shutdown()
     activationStore.shutdown()
@@ -165,7 +164,8 @@ protected trait ControllerTestCommon
                                  version: SemVer = SemVer(),
                                  publish: Boolean = false,
                                  annotations: Parameters = Parameters())
-      extends WhiskEntity(name) {
+      extends WhiskEntity(name, "badEntity") {
+
     override def toJson = BadEntity.serdes.write(this).asJsObject
   }
 
@@ -184,7 +184,7 @@ class DegenerateLoadBalancerService(config: WhiskConfig)(implicit ec: ExecutionC
   override def totalActiveActivations = Future.successful(0)
   override def activeActivationsFor(namespace: UUID) = Future.successful(0)
 
-  override def publish(action: ExecutableWhiskAction, msg: ActivationMessage)(
+  override def publish(action: ExecutableWhiskActionMetaData, msg: ActivationMessage)(
     implicit transid: TransactionId): Future[Future[Either[ActivationId, WhiskActivation]]] =
     Future.successful {
       whiskActivationStub map {
@@ -200,4 +200,5 @@ class DegenerateLoadBalancerService(config: WhiskConfig)(implicit ec: ExecutionC
       } getOrElse Future.failed(new IllegalArgumentException("Unit test does not need fast path"))
     }
 
+  override def invokerHealth() = Future.successful(IndexedSeq.empty)
 }

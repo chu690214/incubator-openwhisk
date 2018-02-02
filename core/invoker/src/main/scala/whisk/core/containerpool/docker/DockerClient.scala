@@ -20,20 +20,27 @@ package whisk.core.containerpool.docker
 import java.io.FileNotFoundException
 import java.nio.file.Files
 import java.nio.file.Paths
+import java.util.concurrent.Semaphore
 
+import akka.actor.ActorSystem
+
+import scala.collection.concurrent.TrieMap
+import scala.concurrent.blocking
 import scala.concurrent.ExecutionContext
 import scala.concurrent.Future
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
-import akka.event.Logging.ErrorLevel
+import akka.event.Logging.{ErrorLevel, InfoLevel}
+import pureconfig.loadConfigOrThrow
 import whisk.common.Logging
 import whisk.common.LoggingMarkers
 import whisk.common.TransactionId
-
-import scala.collection.concurrent.TrieMap
+import whisk.core.ConfigKeys
 import whisk.core.containerpool.ContainerId
 import whisk.core.containerpool.ContainerAddress
+
+import scala.concurrent.duration.Duration
 
 object DockerContainerId {
 
@@ -48,6 +55,17 @@ object DockerContainerId {
 }
 
 /**
+ * Configuration for docker client command timeouts.
+ */
+case class DockerClientTimeoutConfig(run: Duration,
+                                     rm: Duration,
+                                     pull: Duration,
+                                     ps: Duration,
+                                     pause: Duration,
+                                     unpause: Duration,
+                                     inspect: Duration)
+
+/**
  * Serves as interface to the docker CLI tool.
  *
  * Be cautious with the ExecutionContext passed to this, as the
@@ -55,7 +73,10 @@ object DockerContainerId {
  *
  * You only need one instance (and you shouldn't get more).
  */
-class DockerClient(dockerHost: Option[String] = None)(executionContext: ExecutionContext)(implicit log: Logging)
+class DockerClient(dockerHost: Option[String] = None,
+                   timeouts: DockerClientTimeoutConfig =
+                     loadConfigOrThrow[DockerClientTimeoutConfig](ConfigKeys.dockerTimeouts))(
+  executionContext: ExecutionContext)(implicit log: Logging, as: ActorSystem)
     extends DockerApi
     with ProcessRunner {
   implicit private val ec = executionContext
@@ -75,50 +96,69 @@ class DockerClient(dockerHost: Option[String] = None)(executionContext: Executio
     Seq(dockerBin) ++ host
   }
 
+  protected val maxParallelRuns = 10
+  protected val runSemaphore = new Semaphore( /* permits= */ maxParallelRuns, /* fair= */ true)
+
+  // Docker < 1.13.1 has a known problem: if more than 10 containers are created (docker run)
+  // concurrently, there is a good chance that some of them will fail.
+  // See https://github.com/moby/moby/issues/29369
+  // Use a semaphore to make sure that at most 10 `docker run` commands are active
+  // the same time.
   def run(image: String, args: Seq[String] = Seq.empty[String])(
     implicit transid: TransactionId): Future[ContainerId] = {
-    runCmd((Seq("run", "-d") ++ args ++ Seq(image)): _*)
-      .map {
-        ContainerId(_)
+    Future {
+      blocking {
+        // Acquires a permit from this semaphore, blocking until one is available, or the thread is interrupted.
+        // Throws InterruptedException if the current thread is interrupted
+        runSemaphore.acquire()
       }
-      .recoverWith {
-        // https://docs.docker.com/v1.12/engine/reference/run/#/exit-status
-        // Exit code 125 means an error reported by the Docker daemon.
-        // Examples:
-        // - Unrecognized option specified
-        // - Not enough disk space
-        case pre: ProcessRunningException if pre.exitCode == 125 =>
-          Future.failed(
-            DockerContainerId
-              .parse(pre.stdout)
-              .map(BrokenDockerContainer(_, s"Broken container: ${pre.getMessage}"))
-              .getOrElse(pre))
-      }
+    }.flatMap { _ =>
+      // Iff the semaphore was acquired successfully
+      runCmd(Seq("run", "-d") ++ args ++ Seq(image), timeouts.run)
+        .andThen {
+          // Release the semaphore as quick as possible regardless of the runCmd() result
+          case _ => runSemaphore.release()
+        }
+        .map(ContainerId.apply)
+        .recoverWith {
+          // https://docs.docker.com/v1.12/engine/reference/run/#/exit-status
+          // Exit code 125 means an error reported by the Docker daemon.
+          // Examples:
+          // - Unrecognized option specified
+          // - Not enough disk space
+          case pre: ProcessRunningException if pre.exitCode == 125 =>
+            Future.failed(
+              DockerContainerId
+                .parse(pre.stdout)
+                .map(BrokenDockerContainer(_, s"Broken container: ${pre.getMessage}"))
+                .getOrElse(pre))
+        }
+    }
   }
 
   def inspectIPAddress(id: ContainerId, network: String)(implicit transid: TransactionId): Future[ContainerAddress] =
-    runCmd("inspect", "--format", s"{{.NetworkSettings.Networks.${network}.IPAddress}}", id.asString).flatMap {
-      _ match {
-        case "<no value>" => Future.failed(new NoSuchElementException)
-        case stdout       => Future.successful(ContainerAddress(stdout))
-      }
+    runCmd(
+      Seq("inspect", "--format", s"{{.NetworkSettings.Networks.${network}.IPAddress}}", id.asString),
+      timeouts.inspect).flatMap {
+      case "<no value>" => Future.failed(new NoSuchElementException)
+      case stdout       => Future.successful(ContainerAddress(stdout))
     }
 
   def pause(id: ContainerId)(implicit transid: TransactionId): Future[Unit] =
-    runCmd("pause", id.asString).map(_ => ())
+    runCmd(Seq("pause", id.asString), timeouts.pause).map(_ => ())
 
   def unpause(id: ContainerId)(implicit transid: TransactionId): Future[Unit] =
-    runCmd("unpause", id.asString).map(_ => ())
+    runCmd(Seq("unpause", id.asString), timeouts.unpause).map(_ => ())
 
   def rm(id: ContainerId)(implicit transid: TransactionId): Future[Unit] =
-    runCmd("rm", "-f", id.asString).map(_ => ())
+    runCmd(Seq("rm", "-f", id.asString), timeouts.rm).map(_ => ())
 
   def ps(filters: Seq[(String, String)] = Seq(), all: Boolean = false)(
     implicit transid: TransactionId): Future[Seq[ContainerId]] = {
-    val filterArgs = filters.map { case (attr, value) => Seq("--filter", s"$attr=$value") }.flatten
+    val filterArgs = filters.flatMap { case (attr, value) => Seq("--filter", s"$attr=$value") }
     val allArg = if (all) Seq("--all") else Seq.empty[String]
     val cmd = Seq("ps", "--quiet", "--no-trunc") ++ allArg ++ filterArgs
-    runCmd(cmd: _*).map(_.lines.toSeq.map(ContainerId.apply))
+    runCmd(cmd, timeouts.ps).map(_.lines.toSeq.map(ContainerId.apply))
   }
 
   /**
@@ -129,16 +169,20 @@ class DockerClient(dockerHost: Option[String] = None)(executionContext: Executio
   private val pullsInFlight = TrieMap[String, Future[Unit]]()
   def pull(image: String)(implicit transid: TransactionId): Future[Unit] =
     pullsInFlight.getOrElseUpdate(image, {
-      runCmd("pull", image).map(_ => ()).andThen { case _ => pullsInFlight.remove(image) }
+      runCmd(Seq("pull", image), timeouts.pull).map(_ => ()).andThen { case _ => pullsInFlight.remove(image) }
     })
 
   def isOomKilled(id: ContainerId)(implicit transid: TransactionId): Future[Boolean] =
-    runCmd("inspect", id.asString, "--format", "{{.State.OOMKilled}}").map(_.toBoolean)
+    runCmd(Seq("inspect", id.asString, "--format", "{{.State.OOMKilled}}"), timeouts.inspect).map(_.toBoolean)
 
-  private def runCmd(args: String*)(implicit transid: TransactionId): Future[String] = {
+  private def runCmd(args: Seq[String], timeout: Duration)(implicit transid: TransactionId): Future[String] = {
     val cmd = dockerCmd ++ args
-    val start = transid.started(this, LoggingMarkers.INVOKER_DOCKER_CMD(args.head), s"running ${cmd.mkString(" ")}")
-    executeProcess(cmd: _*).andThen {
+    val start = transid.started(
+      this,
+      LoggingMarkers.INVOKER_DOCKER_CMD(args.head),
+      s"running ${cmd.mkString(" ")} (timeout: $timeout)",
+      logLevel = InfoLevel)
+    executeProcess(cmd, timeout).andThen {
       case Success(_) => transid.finished(this, start)
       case Failure(t) => transid.failed(this, start, t.getMessage, ErrorLevel)
     }

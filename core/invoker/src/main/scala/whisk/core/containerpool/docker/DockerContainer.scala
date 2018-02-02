@@ -17,24 +17,37 @@
 
 package whisk.core.containerpool.docker
 
-import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicLong
 
 import akka.actor.ActorSystem
+import akka.stream._
+import akka.stream.scaladsl.Framing.FramingException
 import spray.json._
 
-import scala.concurrent.ExecutionContext
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration._
-import scala.util.Failure
 import whisk.common.Logging
 import whisk.common.TransactionId
 import whisk.core.containerpool._
 import whisk.core.entity.ActivationResponse.{ConnectionError, MemoryExhausted}
-import whisk.core.entity.ByteSize
+import whisk.core.entity.{ActivationEntityLimit, ByteSize}
 import whisk.core.entity.size._
+import akka.stream.scaladsl.{Framing, Source}
+import akka.stream.stage._
+import akka.util.ByteString
+import spray.json._
+import whisk.core.containerpool.logging.LogLine
+import whisk.http.Messages
 
 object DockerContainer {
+
+  /**
+   * The action proxies insert this line in the logs at the end of each activation for stdout/stderr
+   *
+   * Note: Blackbox containers might not add this sentinel, as we cannot be sure the action developer actually does this.
+   */
+  val ActivationSentinel = ByteString("XXX_THE_END_OF_A_WHISK_ACTIVATION_XXX")
 
   /**
    * Creates a container running on a docker daemon.
@@ -87,11 +100,12 @@ object DockerContainer {
       "--network",
       network) ++
       environmentArgs ++
+      dnsServers.flatMap(d => Seq("--dns", d)) ++
       name.map(n => Seq("--name", n)).getOrElse(Seq.empty) ++
       params
     val pulled = if (userProvidedImage) {
       docker.pull(image).recoverWith {
-        case _ => Future.failed(BlackboxStartupError(s"Failed to pull container image '${image}'."))
+        case _ => Future.failed(BlackboxStartupError(Messages.imagePullError(image)))
       }
     } else Future.successful(())
 
@@ -102,17 +116,16 @@ object DockerContainer {
           // Remove the broken container - but don't wait or check for the result.
           // If the removal fails, there is nothing we could do to recover from the recovery.
           docker.rm(brokenId)
-          Future.failed(
-            WhiskContainerStartupError(s"Failed to run container with image '${image}'. Removing broken container."))
+          Future.failed(WhiskContainerStartupError(Messages.resourceProvisionError))
         case _ =>
-          Future.failed(WhiskContainerStartupError(s"Failed to run container with image '${image}'."))
+          Future.failed(WhiskContainerStartupError(Messages.resourceProvisionError))
       }
       ip <- docker.inspectIPAddress(id, network).recoverWith {
         // remove the container immediately if inspect failed as
         // we cannot recover that case automatically
         case _ =>
           docker.rm(id)
-          Future.failed(WhiskContainerStartupError(s"Failed to obtain IP address of container '${id.asString}'."))
+          Future.failed(WhiskContainerStartupError(Messages.resourceProvisionError))
       }
     } yield new DockerContainer(id, ip, useRunc)
   }
@@ -135,15 +148,14 @@ class DockerContainer(protected val id: ContainerId,
                                                       as: ActorSystem,
                                                       protected val ec: ExecutionContext,
                                                       protected val logging: Logging)
-    extends Container
-    with DockerActionLogDriver {
+    extends Container {
 
   /** The last read-position in the log file */
-  private var logFileOffset = 0L
+  private var logFileOffset = new AtomicLong(0)
 
   protected val waitForLogs: FiniteDuration = 2.seconds
   protected val waitForOomState: FiniteDuration = 2.seconds
-  protected val filePollInterval: FiniteDuration = 100.milliseconds
+  protected val filePollInterval: FiniteDuration = 5.milliseconds
 
   def suspend()(implicit transid: TransactionId): Future[Unit] =
     if (useRunc) { runc.pause(id) } else { docker.pause(id) }
@@ -177,7 +189,7 @@ class DockerContainer(protected val id: ContainerId,
     implicit transid: TransactionId): Future[RunResult] = {
     val started = Instant.now()
     val http = httpConnection.getOrElse {
-      val conn = new HttpUtils(s"${addr.host}:${addr.port}", timeout, 1.MB)
+      val conn = new HttpUtils(s"${addr.host}:${addr.port}", timeout, ActivationEntityLimit.MAX_ACTIVATION_ENTITY_LIMIT)
       httpConnection = Some(conn)
       conn
     }
@@ -215,40 +227,97 @@ class DockerContainer(protected val id: ContainerId,
    * the result returned from this method.
    *
    * Only parses and returns as much logs as fit in the passed log limit.
-   * Even if the log limit is exceeded, advance the starting position for the next invocation
-   * behind the bytes most recently read - but don't actively read any more until sentinel
-   * markers have been found.
    *
    * @param limit the limit to apply to the log size
    * @param waitForSentinel determines if the processor should wait for a sentinel to appear
    *
    * @return a vector of Strings with log lines in our own JSON format
    */
-  def logs(limit: ByteSize, waitForSentinel: Boolean)(implicit transid: TransactionId): Future[Vector[String]] = {
-
-    def readLogs(retries: Int): Future[Vector[String]] = {
-      docker
-        .rawContainerLogs(id, logFileOffset)
-        .flatMap { rawLogBytes =>
-          val rawLog =
-            new String(rawLogBytes.array, rawLogBytes.arrayOffset, rawLogBytes.position, StandardCharsets.UTF_8)
-          val (isComplete, isTruncated, formattedLogs) = processJsonDriverLogContents(rawLog, waitForSentinel, limit)
-
-          if (retries > 0 && !isComplete && !isTruncated) {
-            logging.info(this, s"log cursor advanced but missing sentinel, trying $retries more times")
-            akka.pattern.after(filePollInterval, as.scheduler)(readLogs(retries - 1))
-          } else {
-            logFileOffset += rawLogBytes.position - rawLogBytes.arrayOffset
-            Future.successful(formattedLogs)
-          }
-        }
-        .andThen {
-          case Failure(e) =>
-            logging.error(this, s"Failed to obtain logs of ${id.asString}: ${e.getClass} - ${e.getMessage}")
-        }
-    }
-
-    readLogs((waitForLogs / filePollInterval).toInt)
+  def logs(limit: ByteSize, waitForSentinel: Boolean)(implicit transid: TransactionId): Source[ByteString, Any] = {
+    docker
+      .rawContainerLogs(id, logFileOffset.get(), if (waitForSentinel) Some(filePollInterval) else None)
+      // This stage only throws 'FramingException' so we cannot decide whether we got truncated due to a size
+      // constraint (like StreamLimitReachedException below) or due to the file being truncated itself.
+      .via(Framing.delimiter(delimiter, limit.toBytes.toInt))
+      .limitWeighted(limit.toBytes) { obj =>
+        // Adding + 1 since we know there's a newline byte being read
+        val size = obj.size + 1
+        logFileOffset.addAndGet(size)
+        size
+      }
+      .via(new CompleteAfterOccurrences(_.containsSlice(DockerContainer.ActivationSentinel), 2, waitForSentinel))
+      .recover {
+        case _: StreamLimitReachedException =>
+          // While the stream has already ended by failing the limitWeighted stage above, we inject a truncation
+          // notice downstream, which will be processed as usual. This will be the last element of the stream.
+          ByteString(LogLine(Instant.now.toString, "stderr", Messages.truncateLogs(limit)).toJson.compactPrint)
+        case _: OccurrencesNotFoundException | _: FramingException =>
+          // Stream has already ended and we insert a notice that data might be missing from the logs. While a
+          // FramingException can also mean exceeding the limits, we cannot decide which case happened so we resort
+          // to the general error message. This will be the last element of the stream.
+          ByteString(LogLine(Instant.now.toString, "stderr", Messages.logFailure).toJson.compactPrint)
+      }
+      .takeWithin(waitForLogs)
   }
 
+  /** Delimiter used to split log-lines as written by the json-log-driver. */
+  private val delimiter = ByteString("\n")
 }
+
+/**
+ * Completes the stream once the given predicate is fulfilled by N events in the stream.
+ *
+ * '''Emits when''' an upstream element arrives and does not fulfill the predicate
+ *
+ * '''Backpressures when''' downstream backpressures
+ *
+ * '''Completes when''' upstream completes or predicate is fulfilled N times
+ *
+ * '''Cancels when''' downstream cancels
+ *
+ * '''Errors when''' stream completes, not enough occurrences have been found and errorOnNotEnough is true
+ */
+class CompleteAfterOccurrences[T](isInEvent: T => Boolean, neededOccurrences: Int, errorOnNotEnough: Boolean)
+    extends GraphStage[FlowShape[T, T]] {
+  val in = Inlet[T]("WaitForOccurances.in")
+  val out = Outlet[T]("WaitForOccurances.out")
+  override val shape = FlowShape.of(in, out)
+
+  override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
+    new GraphStageLogic(shape) with InHandler with OutHandler {
+      private var occurrencesFound = 0
+
+      override def onPull(): Unit = pull(in)
+
+      override def onPush(): Unit = {
+        val element = grab(in)
+        val isOccurrence = isInEvent(element)
+
+        if (isOccurrence) occurrencesFound += 1
+
+        if (occurrencesFound >= neededOccurrences) {
+          completeStage()
+        } else {
+          if (isOccurrence) {
+            pull(in)
+          } else {
+            push(out, element)
+          }
+        }
+      }
+
+      override def onUpstreamFinish(): Unit = {
+        if (occurrencesFound >= neededOccurrences || !errorOnNotEnough) {
+          completeStage()
+        } else {
+          failStage(OccurrencesNotFoundException(neededOccurrences, occurrencesFound))
+        }
+      }
+
+      setHandlers(in, out, this)
+    }
+}
+
+/** Indicates that Occurrences have not been found in the stream */
+case class OccurrencesNotFoundException(neededCount: Int, actualCount: Int)
+    extends RuntimeException(s"Only found $actualCount out of $neededCount occurrences.")

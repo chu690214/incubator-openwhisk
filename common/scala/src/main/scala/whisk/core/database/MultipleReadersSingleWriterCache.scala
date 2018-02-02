@@ -91,12 +91,18 @@ private object MultipleReadersSingleWriterCache {
 
 trait CacheChangeNotification extends (CacheKey => Future[Unit])
 
+sealed trait EvictionPolicy
+
+case object AccessTime extends EvictionPolicy
+case object WriteTime extends EvictionPolicy
+
 trait MultipleReadersSingleWriterCache[W, Winfo] {
   import MultipleReadersSingleWriterCache._
   import MultipleReadersSingleWriterCache.State._
 
   /** Subclasses: Toggle this to enable/disable caching for your entity type. */
   protected val cacheEnabled = true
+  protected val evictionPolicy: EvictionPolicy = AccessTime
 
   private object Entry {
     def apply(transid: TransactionId, state: State, value: Option[Future[W]]): Entry = {
@@ -161,8 +167,6 @@ trait MultipleReadersSingleWriterCache[W, Winfo] {
     if (cacheEnabled) {
       logger.info(this, s"invalidating $key on delete")
 
-      notifier.foreach(_(key))
-
       // try inserting our desired entry...
       val desiredEntry = Entry(transid, InvalidateInProgress, None)
       cache(key)(desiredEntry) flatMap { actualEntry =>
@@ -206,6 +210,8 @@ trait MultipleReadersSingleWriterCache[W, Winfo] {
             // a pre-existing owner will take care of the invalidation
             invalidator
         }
+      } andThen {
+        case _ => notifier.foreach(_(key))
       }
     } else invalidator // not caching
   }
@@ -265,8 +271,6 @@ trait MultipleReadersSingleWriterCache[W, Winfo] {
     notifier: Option[CacheChangeNotification]): Future[Winfo] = {
     if (cacheEnabled) {
 
-      notifier.foreach(_(key))
-
       // try inserting our desired entry...
       val desiredEntry = Entry(transid, WriteInProgress, Some(Future.successful(doc)))
       cache(key)(desiredEntry) flatMap { actualEntry =>
@@ -292,6 +296,8 @@ trait MultipleReadersSingleWriterCache[W, Winfo] {
             invalidateEntryAfter(generator, key, actualEntry)
           }
         }
+      } andThen {
+        case _ => notifier.foreach(_(key))
       }
     } else generator // not caching
   }
@@ -309,7 +315,7 @@ trait MultipleReadersSingleWriterCache[W, Winfo] {
    *
    */
   private def makeNoteOfCacheHit(key: CacheKey)(implicit transid: TransactionId, logger: Logging) = {
-    transid.mark(this, LoggingMarkers.DATABASE_CACHE_HIT, s"[GET] serving from cache: $key")(logger)
+    transid.started(this, LoggingMarkers.DATABASE_CACHE_HIT, s"[GET] serving from cache: $key")(logger)
   }
 
   /**
@@ -317,7 +323,7 @@ trait MultipleReadersSingleWriterCache[W, Winfo] {
    *
    */
   private def makeNoteOfCacheMiss(key: CacheKey)(implicit transid: TransactionId, logger: Logging) = {
-    transid.mark(this, LoggingMarkers.DATABASE_CACHE_MISS, s"[GET] serving from datastore: $key")(logger)
+    transid.started(this, LoggingMarkers.DATABASE_CACHE_MISS, s"[GET] serving from datastore: $key")(logger)
   }
 
   /**
@@ -438,14 +444,27 @@ trait MultipleReadersSingleWriterCache[W, Winfo] {
   }
 
   /** This is the backing store. */
-  private val cache: ConcurrentMapBackedCache[Entry] = new ConcurrentMapBackedCache(
-    Caffeine
-      .newBuilder()
-      .asInstanceOf[Caffeine[Any, Future[Entry]]]
-      .expireAfterWrite(5, TimeUnit.MINUTES)
-      .softValues()
-      .build()
-      .asMap())
+  private lazy val cache: ConcurrentMapBackedCache[Entry] = evictionPolicy match {
+    case AccessTime =>
+      new ConcurrentMapBackedCache(
+        Caffeine
+          .newBuilder()
+          .asInstanceOf[Caffeine[Any, Future[Entry]]]
+          .expireAfterAccess(5, TimeUnit.MINUTES)
+          .softValues()
+          .build()
+          .asMap())
+
+    case _ =>
+      new ConcurrentMapBackedCache(
+        Caffeine
+          .newBuilder()
+          .asInstanceOf[Caffeine[Any, Future[Entry]]]
+          .expireAfterWrite(5, TimeUnit.MINUTES)
+          .softValues()
+          .build()
+          .asMap())
+  }
 }
 
 /**

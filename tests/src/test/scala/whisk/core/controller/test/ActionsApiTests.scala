@@ -36,6 +36,7 @@ import spray.json.DefaultJsonProtocol._
 import whisk.core.controller.WhiskActionsApi
 import whisk.core.entity._
 import whisk.core.entity.size._
+import whisk.core.entitlement.Collection
 import whisk.http.ErrorResponse
 import whisk.http.Messages
 
@@ -65,6 +66,14 @@ class ActionsApiTests extends ControllerTestCommon with WhiskActionsApi {
   val parametersLimit = Parameters.sizeLimit
 
   //// GET /actions
+  it should "return empty list when no actions exist" in {
+    implicit val tid = transid()
+    Get(collectionPath) ~> Route.seal(routes(creds)) ~> check {
+      status should be(OK)
+      responseAs[List[JsObject]] shouldBe 'empty
+    }
+  }
+
   it should "list actions by default namespace" in {
     implicit val tid = transid()
     val actions = (1 to 2).map { i =>
@@ -72,13 +81,22 @@ class ActionsApiTests extends ControllerTestCommon with WhiskActionsApi {
     }.toList
     actions foreach { put(entityStore, _) }
     waitOnView(entityStore, WhiskAction, namespace, 2)
-    Get(s"$collectionPath") ~> Route.seal(routes(creds)) ~> check {
+    Get(collectionPath) ~> Route.seal(routes(creds)) ~> check {
       status should be(OK)
       val response = responseAs[List[JsObject]]
       actions.length should be(response.length)
-      actions forall { a =>
-        response contains a.summaryAsJson
-      } should be(true)
+      response should contain theSameElementsAs actions.map(_.summaryAsJson)
+    }
+  }
+
+  it should "reject list when limit is greater than maximum allowed value" in {
+    implicit val tid = transid()
+    val exceededMaxLimit = Collection.MAX_LIST_LIMIT + 1
+    val response = Get(s"$collectionPath?limit=$exceededMaxLimit") ~> Route.seal(routes(creds)) ~> check {
+      status should be(BadRequest)
+      responseAs[String] should include {
+        Messages.maxListLimitExceeded(Collection.ACTIONS, exceededMaxLimit, Collection.MAX_LIST_LIMIT)
+      }
     }
   }
 
@@ -94,9 +112,7 @@ class ActionsApiTests extends ControllerTestCommon with WhiskActionsApi {
       status should be(OK)
       val response = responseAs[List[WhiskAction]]
       actions.length should be(response.length)
-      actions forall { a =>
-        response contains a
-      } should be(true)
+      response should contain theSameElementsAs actions.map(_.summaryAsJson)
     }
   }
 
@@ -111,9 +127,7 @@ class ActionsApiTests extends ControllerTestCommon with WhiskActionsApi {
       status should be(OK)
       val response = responseAs[List[JsObject]]
       actions.length should be(response.length)
-      actions forall { a =>
-        response contains a.summaryAsJson
-      } should be(true)
+      response should contain theSameElementsAs actions.map(_.summaryAsJson)
     }
 
     // it should "reject list action with explicit namespace not owned by subject" in {
@@ -125,7 +139,7 @@ class ActionsApiTests extends ControllerTestCommon with WhiskActionsApi {
 
   it should "list should reject request with post" in {
     implicit val tid = transid()
-    Post(s"$collectionPath") ~> Route.seal(routes(creds)) ~> check {
+    Post(collectionPath) ~> Route.seal(routes(creds)) ~> check {
       status should be(MethodNotAllowed)
     }
   }
@@ -156,6 +170,29 @@ class ActionsApiTests extends ControllerTestCommon with WhiskActionsApi {
     val auser = WhiskAuthHelpers.newIdentity()
     Get(s"/$namespace/${collection.path}/${action.name}") ~> Route.seal(routes(auser)) ~> check {
       status should be(Forbidden)
+    }
+  }
+
+  it should "get action using code query parameter" in {
+    implicit val tid = transid()
+    val action = WhiskAction(namespace, aname(), jsDefault("??"), Parameters("x", "b"))
+
+    put(entityStore, action)
+
+    Get(s"$collectionPath/${action.name}?code=false") ~> Route.seal(routes(creds)) ~> check {
+      status should be(OK)
+      val response = responseAs[JsObject]
+      response.fields("exec").asJsObject.fields should not(contain key "code")
+      responseAs[WhiskActionMetaData] shouldBe a[WhiskActionMetaData]
+    }
+
+    Seq(s"$collectionPath/${action.name}", s"$collectionPath/${action.name}?code=true").foreach { path =>
+      Get(path) ~> Route.seal(routes(creds)) ~> check {
+        status should be(OK)
+        val response = responseAs[JsObject]
+        response.fields("exec").asJsObject.fields("code") should be("??".toJson)
+        responseAs[WhiskAction] shouldBe a[WhiskAction]
+      }
     }
   }
 
@@ -503,68 +540,95 @@ class ActionsApiTests extends ControllerTestCommon with WhiskActionsApi {
     }
   }
 
-  it should "put and then get action from cache" in {
-    val action = WhiskAction(namespace, aname(), jsDefault("??"), Parameters("x", "b"))
-    val content = WhiskActionPut(
-      Some(action.exec),
-      Some(action.parameters),
-      Some(ActionLimitsOption(Some(action.limits.timeout), Some(action.limits.memory), Some(action.limits.logs))))
-    val name = action.name
+  it should "put and then get an action from cache" in {
+    val javaAction =
+      WhiskAction(namespace, aname(), javaDefault("ZHViZWU=", Some("hello")), annotations = Parameters("exec", "java"))
+    val nodeAction = WhiskAction(namespace, aname(), jsDefault("??"), Parameters("x", "b"))
+    val actions = Seq((javaAction, JAVA_DEFAULT), (nodeAction, NODEJS6))
 
-    // first request invalidates any previous entries and caches new result
-    Put(s"$collectionPath/$name", content) ~> Route.seal(routes(creds)(transid())) ~> check {
-      status should be(OK)
-      val response = responseAs[WhiskAction]
-      response should be(
-        WhiskAction(
-          action.namespace,
-          action.name,
-          action.exec,
-          action.parameters,
-          action.limits,
-          action.version,
-          action.publish,
-          action.annotations ++ Parameters(WhiskAction.execFieldName, NODEJS6)))
+    actions.foreach {
+      case (action, kind) =>
+        val content = WhiskActionPut(
+          Some(action.exec),
+          Some(action.parameters),
+          Some(ActionLimitsOption(Some(action.limits.timeout), Some(action.limits.memory), Some(action.limits.logs))))
+
+        // first request invalidates any previous entries and caches new result
+        Put(s"$collectionPath/${action.name}", content) ~> Route.seal(routes(creds)(transid())) ~> check {
+          status should be(OK)
+          val response = responseAs[WhiskAction]
+          response should be(
+            WhiskAction(
+              action.namespace,
+              action.name,
+              action.exec,
+              action.parameters,
+              action.limits,
+              action.version,
+              action.publish,
+              action.annotations ++ Parameters(WhiskAction.execFieldName, kind)))
+        }
+        stream.toString should include(s"caching ${CacheKey(action)}")
+        stream.toString should not include (s"invalidating ${CacheKey(action)} on delete")
+        stream.reset()
+
+        // second request should fetch from cache
+        Get(s"$collectionPath/${action.name}") ~> Route.seal(routes(creds)(transid())) ~> check {
+          status should be(OK)
+          val response = responseAs[WhiskAction]
+          response should be(
+            WhiskAction(
+              action.namespace,
+              action.name,
+              action.exec,
+              action.parameters,
+              action.limits,
+              action.version,
+              action.publish,
+              action.annotations ++ Parameters(WhiskAction.execFieldName, kind)))
+        }
+        stream.toString should include(s"serving from cache: ${CacheKey(action)}")
+        stream.reset()
+
+        // update should invalidate cache
+        Put(s"$collectionPath/${action.name}?overwrite=true", content) ~> Route.seal(routes(creds)(transid())) ~> check {
+          status should be(OK)
+          val response = responseAs[WhiskAction]
+          response should be {
+            WhiskAction(
+              action.namespace,
+              action.name,
+              action.exec,
+              action.parameters,
+              action.limits,
+              action.version.upPatch,
+              action.publish,
+              action.annotations ++ Parameters(WhiskAction.execFieldName, kind))
+          }
+        }
+        stream.toString should include(s"entity exists, will try to update '$action'")
+        stream.toString should include(s"invalidating ${CacheKey(action)}")
+        stream.toString should include(s"caching ${CacheKey(action)}")
+        stream.reset()
+
+        // delete should invalidate cache
+        Delete(s"$collectionPath/${action.name}") ~> Route.seal(routes(creds)(transid())) ~> check {
+          status should be(OK)
+          val response = responseAs[WhiskAction]
+          response should be(
+            WhiskAction(
+              action.namespace,
+              action.name,
+              action.exec,
+              action.parameters,
+              action.limits,
+              action.version.upPatch,
+              action.publish,
+              action.annotations ++ Parameters(WhiskAction.execFieldName, kind)))
+        }
+        stream.toString should include(s"invalidating ${CacheKey(action)}")
+        stream.reset()
     }
-    stream.toString should include(s"caching ${CacheKey(action)}")
-    stream.reset()
-
-    // second request should fetch from cache
-    Get(s"$collectionPath/$name") ~> Route.seal(routes(creds)(transid())) ~> check {
-      status should be(OK)
-      val response = responseAs[WhiskAction]
-      response should be(
-        WhiskAction(
-          action.namespace,
-          action.name,
-          action.exec,
-          action.parameters,
-          action.limits,
-          action.version,
-          action.publish,
-          action.annotations ++ Parameters(WhiskAction.execFieldName, NODEJS6)))
-    }
-
-    stream.toString should include(s"serving from cache: ${CacheKey(action)}")
-    stream.reset()
-
-    // delete should invalidate cache
-    Delete(s"$collectionPath/$name") ~> Route.seal(routes(creds)(transid())) ~> check {
-      status should be(OK)
-      val response = responseAs[WhiskAction]
-      response should be(
-        WhiskAction(
-          action.namespace,
-          action.name,
-          action.exec,
-          action.parameters,
-          action.limits,
-          action.version,
-          action.publish,
-          action.annotations ++ Parameters(WhiskAction.execFieldName, NODEJS6)))
-    }
-    stream.toString should include(s"invalidating ${CacheKey(action)}")
-    stream.reset()
   }
 
   it should "reject put with conflict for pre-existing action" in {
@@ -810,6 +874,19 @@ class ActionsApiTests extends ControllerTestCommon with WhiskActionsApi {
     } finally {
       deleteActivation(activation.docid)
     }
+  }
+
+  it should "ensure WhiskActionMetadata is used to invoke an action" in {
+    implicit val tid = transid()
+    val action = WhiskAction(namespace, aname(), jsDefault("??"))
+    put(entityStore, action)
+    Post(s"$collectionPath/${action.name}") ~> Route.seal(routes(creds)) ~> check {
+      status should be(Accepted)
+      val response = responseAs[JsObject]
+      response.fields("activationId") should not be None
+    }
+    stream.toString should include(s"[WhiskActionMetaData] [GET] serving from datastore: ${CacheKey(action)}")
+    stream.reset()
   }
 
   it should "report proper error when record is corrupted on delete" in {

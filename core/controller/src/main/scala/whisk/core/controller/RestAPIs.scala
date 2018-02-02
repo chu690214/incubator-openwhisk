@@ -19,6 +19,10 @@ package whisk.core.controller
 
 import scala.concurrent.ExecutionContext
 
+import scala.util.Failure
+import scala.util.Success
+import scala.util.Try
+
 import akka.actor.ActorSystem
 import akka.http.scaladsl.model.StatusCodes._
 import akka.http.scaladsl.model.Uri
@@ -42,7 +46,8 @@ import whisk.core.entity._
 import whisk.core.entity.ActivationId.ActivationIdGenerator
 import whisk.core.entity.WhiskAuthStore
 import whisk.core.entity.types._
-import whisk.core.loadBalancer.LoadBalancerService
+import whisk.core.loadBalancer.LoadBalancer
+import whisk.http.Messages
 
 /**
  * Abstract class which provides basic Directives which are used to construct route structures
@@ -115,6 +120,22 @@ protected[controller] object RestApiCommons {
     }
   }
 
+  /** Custom unmarshaller for query parameters "limit" for "list" operations. */
+  case class ListLimit(n: Int)
+
+  def stringToListLimit(collection: Collection): Unmarshaller[String, ListLimit] = {
+    Unmarshaller.strict[String, ListLimit] { value =>
+      Try { value.toInt } match {
+        case Success(n) if (n == 0)                                  => ListLimit(Collection.MAX_LIST_LIMIT)
+        case Success(n) if (n > 0 && n <= Collection.MAX_LIST_LIMIT) => ListLimit(n)
+        case Success(n) =>
+          throw new IllegalArgumentException(
+            Messages.maxListLimitExceeded(collection.path, n, Collection.MAX_LIST_LIMIT))
+        case Failure(t) => throw new IllegalArgumentException(Messages.listLimitIsNotAString)
+      }
+    }
+  }
+
   /** Pretty print JSON response. */
   implicit val jsonPrettyResponsePrinter = PrettyPrinter
 
@@ -140,7 +161,7 @@ class RestAPIVersion(config: WhiskConfig, apiPath: String, apiVersion: String)(
   implicit val entityStore: EntityStore,
   implicit val entitlementProvider: EntitlementProvider,
   implicit val activationIdFactory: ActivationIdGenerator,
-  implicit val loadBalancer: LoadBalancerService,
+  implicit val loadBalancer: LoadBalancer,
   implicit val cacheChangeNotification: Some[CacheChangeNotification],
   implicit val activationStore: ActivationStore,
   implicit val logStore: LogStore,
@@ -222,7 +243,7 @@ class RestAPIVersion(config: WhiskConfig, apiPath: String, apiVersion: String)(
     override val activationStore: ActivationStore,
     override val entitlementProvider: EntitlementProvider,
     override val activationIdFactory: ActivationIdGenerator,
-    override val loadBalancer: LoadBalancerService,
+    override val loadBalancer: LoadBalancer,
     override val cacheChangeNotification: Some[CacheChangeNotification],
     override val executionContext: ExecutionContext,
     override val logging: Logging,
@@ -245,7 +266,7 @@ class RestAPIVersion(config: WhiskConfig, apiPath: String, apiVersion: String)(
     implicit override val entityStore: EntityStore,
     override val entitlementProvider: EntitlementProvider,
     override val activationIdFactory: ActivationIdGenerator,
-    override val loadBalancer: LoadBalancerService,
+    override val loadBalancer: LoadBalancer,
     override val cacheChangeNotification: Some[CacheChangeNotification],
     override val executionContext: ExecutionContext,
     override val logging: Logging,
@@ -258,7 +279,7 @@ class RestAPIVersion(config: WhiskConfig, apiPath: String, apiVersion: String)(
     override val entityStore: EntityStore,
     override val entitlementProvider: EntitlementProvider,
     override val activationIdFactory: ActivationIdGenerator,
-    override val loadBalancer: LoadBalancerService,
+    override val loadBalancer: LoadBalancer,
     override val cacheChangeNotification: Some[CacheChangeNotification],
     override val executionContext: ExecutionContext,
     override val logging: Logging,
@@ -272,7 +293,7 @@ class RestAPIVersion(config: WhiskConfig, apiPath: String, apiVersion: String)(
     override val entitlementProvider: EntitlementProvider,
     override val activationStore: ActivationStore,
     override val activationIdFactory: ActivationIdGenerator,
-    override val loadBalancer: LoadBalancerService,
+    override val loadBalancer: LoadBalancer,
     override val cacheChangeNotification: Some[CacheChangeNotification],
     override val executionContext: ExecutionContext,
     override val logging: Logging,
@@ -289,7 +310,7 @@ class RestAPIVersion(config: WhiskConfig, apiPath: String, apiVersion: String)(
     override val activationStore: ActivationStore,
     override val entitlementProvider: EntitlementProvider,
     override val activationIdFactory: ActivationIdGenerator,
-    override val loadBalancer: LoadBalancerService,
+    override val loadBalancer: LoadBalancer,
     override val actorSystem: ActorSystem,
     override val executionContext: ExecutionContext,
     override val logging: Logging,

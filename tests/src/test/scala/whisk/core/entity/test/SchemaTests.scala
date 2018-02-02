@@ -19,24 +19,22 @@ package whisk.core.entity.test
 
 import java.util.Base64
 
-import scala.BigInt
-import scala.Vector
 import scala.concurrent.duration.DurationInt
 import scala.language.postfixOps
 import scala.language.reflectiveCalls
 import scala.util.Failure
 import scala.util.Try
-
 import org.junit.runner.RunWith
 import org.scalatest.BeforeAndAfter
 import org.scalatest.FlatSpec
 import org.scalatest.Matchers
 import org.scalatest.junit.JUnitRunner
-
 import spray.json._
 import spray.json.DefaultJsonProtocol._
+import whisk.common.TransactionId
 import whisk.core.controller.test.WhiskAuthHelpers
 import whisk.core.entitlement.Privilege
+import whisk.core.entity.ExecManifest.{ImageName, RuntimeManifest}
 import whisk.core.entity._
 import whisk.core.entity.size.SizeInt
 import whisk.http.Messages
@@ -69,6 +67,43 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     Privilege.serdes.read("READ".toJson) shouldBe Privilege.READ
     Privilege.serdes.read("read".toJson) shouldBe Privilege.READ
     a[DeserializationException] should be thrownBy Privilege.serdes.read("???".toJson)
+  }
+
+  behavior of "TransactionId"
+
+  it should "serdes a transaction id without extraLogging parameter" in {
+    val txIdWithoutParameter = TransactionId(4711)
+
+    // test serialization
+    val serializedTxIdWithoutParameter = TransactionId.serdes.write(txIdWithoutParameter)
+    serializedTxIdWithoutParameter match {
+      case JsArray(Vector(JsNumber(id), JsNumber(_))) =>
+        assert(id == txIdWithoutParameter.meta.id)
+      case _ => withClue(serializedTxIdWithoutParameter) { assert(false) }
+    }
+
+    // test deserialization
+    val deserializedTxIdWithoutParameter = TransactionId.serdes.read(serializedTxIdWithoutParameter)
+    deserializedTxIdWithoutParameter.meta.id should equal(txIdWithoutParameter.meta.id)
+    deserializedTxIdWithoutParameter.meta.extraLogging should equal(false)
+  }
+
+  it should "serdes a transaction id with extraLogging parameter" in {
+    val txIdWithParameter = TransactionId(4711, true)
+
+    // test serialization
+    val serializedTxIdWithParameter = TransactionId.serdes.write(txIdWithParameter)
+    serializedTxIdWithParameter match {
+      case JsArray(Vector(JsNumber(id), JsNumber(_), JsBoolean(extraLogging))) =>
+        assert(id == txIdWithParameter.meta.id)
+        assert(extraLogging)
+      case _ => withClue(serializedTxIdWithParameter) { assert(false) }
+    }
+
+    // test deserialization
+    val deserializedTxIdWithParameter = TransactionId.serdes.read(serializedTxIdWithParameter)
+    deserializedTxIdWithParameter.meta.id should equal(txIdWithParameter.meta.id)
+    assert(deserializedTxIdWithParameter.meta.extraLogging)
   }
 
   behavior of "Identity"
@@ -400,7 +435,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       JsObject("kind" -> "nodejs:6".toJson, "code" -> "js1".toJson, "binary" -> false.toJson),
       JsObject("kind" -> "nodejs:6".toJson, "code" -> "js2".toJson, "binary" -> false.toJson, "foo" -> "bar".toJson),
       JsObject("kind" -> "swift".toJson, "code" -> "swift1".toJson, "binary" -> false.toJson),
-      JsObject("kind" -> "swift:3".toJson, "code" -> b64Body.toJson, "binary" -> true.toJson),
+      JsObject("kind" -> "swift:3.1.1".toJson, "code" -> b64Body.toJson, "binary" -> true.toJson),
       JsObject("kind" -> "nodejs:6".toJson, "code" -> b64Body.toJson, "binary" -> true.toJson))
 
     val execs = json.map { e =>
@@ -467,6 +502,26 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     ExecutableWhiskAction(EntityPath("a"), EntityName("b"), bb("container1", "", Some("naim"))).containerInitializer shouldBe {
       JsObject("name" -> "b".toJson, "binary" -> false.toJson, "main" -> "naim".toJson)
     }
+  }
+
+  it should "compare as equal two actions even if their revision does not match" in {
+    val exec = CodeExecAsString(RuntimeManifest("actionKind", ImageName("testImage")), "testCode", None)
+    val actionA = WhiskAction(EntityPath("actionSpace"), EntityName("actionName"), exec)
+    val actionB = actionA.copy()
+    val actionC = actionA.copy()
+    actionC.revision(DocRevision("2"))
+    actionA shouldBe actionB
+    actionA shouldBe actionC
+  }
+
+  it should "compare as equal two executable actions even if their revision does not match" in {
+    val exec = CodeExecAsString(RuntimeManifest("actionKind", ImageName("testImage")), "testCode", None)
+    val actionA = ExecutableWhiskAction(EntityPath("actionSpace"), EntityName("actionName"), exec)
+    val actionB = actionA.copy()
+    val actionC = actionA.copy()
+    actionC.revision(DocRevision("2"))
+    actionA shouldBe actionB
+    actionA shouldBe actionC
   }
 
   it should "reject malformed JSON" in {
@@ -582,16 +637,16 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
     val json = Seq[JsValue](
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
-        "memory" -> MemoryLimit.STD_MEMORY.toMB.toInt.toJson,
+        "memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson,
         "logs" -> LogLimit.STD_LOGSIZE.toMB.toInt.toJson),
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
-        "memory" -> MemoryLimit.STD_MEMORY.toMB.toInt.toJson,
+        "memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson,
         "logs" -> LogLimit.STD_LOGSIZE.toMB.toInt.toJson,
         "foo" -> "bar".toJson),
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
-        "memory" -> MemoryLimit.STD_MEMORY.toMB.toInt.toJson))
+        "memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson))
     val limits = json.map(ActionLimits.serdes.read)
     assert(limits(0) == ActionLimits())
     assert(limits(1) == ActionLimits())
@@ -607,19 +662,19 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       JsObject(),
       JsNull,
       JsObject("timeout" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson),
-      JsObject("memory" -> MemoryLimit.STD_MEMORY.toMB.toInt.toJson),
+      JsObject("memory" -> MemoryLimit.stdMemory.toMB.toInt.toJson),
       JsObject("logs" -> (LogLimit.STD_LOGSIZE.toMB.toInt + 1).toJson),
       JsObject(
         "TIMEOUT" -> TimeLimit.STD_DURATION.toMillis.toInt.toJson,
-        "MEMORY" -> MemoryLimit.STD_MEMORY.toMB.toInt.toJson),
+        "MEMORY" -> MemoryLimit.stdMemory.toMB.toInt.toJson),
       JsObject(
         "timeout" -> (TimeLimit.STD_DURATION.toMillis.toDouble + .01).toJson,
-        "memory" -> (MemoryLimit.STD_MEMORY.toMB.toDouble + .01).toJson),
+        "memory" -> (MemoryLimit.stdMemory.toMB.toDouble + .01).toJson),
       JsObject("timeout" -> null, "memory" -> null),
       JsObject("timeout" -> JsNull, "memory" -> JsNull),
       JsObject(
         "timeout" -> TimeLimit.STD_DURATION.toMillis.toString.toJson,
-        "memory" -> MemoryLimit.STD_MEMORY.toMB.toInt.toString.toJson))
+        "memory" -> MemoryLimit.stdMemory.toMB.toInt.toString.toJson))
 
     limits.foreach { p =>
       a[DeserializationException] should be thrownBy ActionLimits.serdes.read(p)
@@ -655,7 +710,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       LogLimit())
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
-      MemoryLimit(MemoryLimit.MIN_MEMORY - 1.B),
+      MemoryLimit(MemoryLimit.minMemory - 1.B),
       LogLimit())
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
@@ -668,7 +723,7 @@ class SchemaTests extends FlatSpec with BeforeAndAfter with ExecHelpers with Mat
       LogLimit())
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),
-      MemoryLimit(MemoryLimit.MAX_MEMORY + 1.B),
+      MemoryLimit(MemoryLimit.maxMemory + 1.B),
       LogLimit())
     an[IllegalArgumentException] should be thrownBy ActionLimits(
       TimeLimit(),

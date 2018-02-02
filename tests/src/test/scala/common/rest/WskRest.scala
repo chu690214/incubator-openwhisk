@@ -21,13 +21,11 @@ import java.io.File
 import java.time.Instant
 import java.util.Base64
 import java.security.cert.X509Certificate
-
 import org.apache.commons.io.FileUtils
 import org.scalatest.Matchers
 import org.scalatest.FlatSpec
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.time.Span.convertDurationToSpan
-
 import scala.Left
 import scala.Right
 import scala.collection.JavaConversions.mapAsJavaMap
@@ -35,13 +33,12 @@ import scala.collection.mutable.Buffer
 import scala.collection.immutable.Seq
 import scala.concurrent.duration.Duration
 import scala.concurrent.duration.DurationInt
-import scala.concurrent.Future
+import scala.concurrent.{Future, Promise}
 import scala.language.postfixOps
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
 import scala.util.{Failure, Success}
-
 import akka.http.scaladsl.model.StatusCode
 import akka.http.scaladsl.model.StatusCodes.Accepted
 import akka.http.scaladsl.model.StatusCodes.NotFound
@@ -62,15 +59,15 @@ import akka.http.scaladsl.model.HttpMethods.GET
 import akka.http.scaladsl.model.HttpMethods.POST
 import akka.http.scaladsl.model.HttpMethods.PUT
 import akka.http.scaladsl.HttpsConnectionContext
-
+import akka.http.scaladsl.settings.ConnectionPoolSettings
 import akka.stream.ActorMaterializer
-
+import akka.stream.scaladsl.{Keep, Sink, Source}
+import akka.stream.{OverflowStrategy, QueueOfferResult}
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 import spray.json.JsObject
 import spray.json.JsValue
 import spray.json.pimpString
-
 import common._
 import common.BaseDeleteFromCollection
 import common.BaseListOrGetFromCollection
@@ -86,16 +83,14 @@ import common.WaitFor
 import common.WhiskProperties
 import common.WskActorSystem
 import common.WskProps
-
 import whisk.core.entity.ByteSize
 import whisk.utils.retry
-
 import javax.net.ssl.{HostnameVerifier, KeyManager, SSLContext, SSLSession, X509TrustManager}
-
 import com.typesafe.sslconfig.akka.AkkaSSLConfig
+import java.nio.charset.StandardCharsets
 
 class AcceptAllHostNameVerifier extends HostnameVerifier {
-  def verify(s: String, sslSession: SSLSession) = true
+  override def verify(s: String, sslSession: SSLSession): Boolean = true
 }
 
 object SSL {
@@ -138,8 +133,9 @@ trait ListOrGetFromCollectionRest extends BaseListOrGetFromCollection {
                     expectedExitCode: Int = OK.intValue)(implicit wp: WskProps): RestResult = {
 
     val entPath = namespace map { ns =>
-      val (ns, name) = getNamespaceEntityName(resolve(namespace))
-      Path(s"$basePath/namespaces/$ns/$noun/$name/")
+      val (nspace, name) = getNamespaceEntityName(resolve(namespace))
+      if (name.isEmpty) Path(s"$basePath/namespaces/$nspace/$noun")
+      else Path(s"$basePath/namespaces/$nspace/$noun/$name/")
     } getOrElse Path(s"$basePath/namespaces/${wp.namespace}/$noun")
 
     val paramMap = Map[String, String]() ++ { Map("skip" -> "0", "docs" -> true.toString) } ++ {
@@ -186,8 +182,8 @@ trait DeleteFromCollectionRest extends BaseDeleteFromCollection {
    * @param expectedExitCode (optional) the expected exit code for the command
    * if the code is anything but DONTCARE_EXIT, assert the code is as expected
    */
-  override def delete(entity: String, expectedExitCode: Int = OK.intValue)(implicit wp: WskProps): RestResult = {
-    val (ns, entityName) = getNamespaceEntityName(entity)
+  override def delete(name: String, expectedExitCode: Int = OK.intValue)(implicit wp: WskProps): RestResult = {
+    val (ns, entityName) = getNamespaceEntityName(name)
     val path = Path(s"$basePath/namespaces/$ns/$noun/$entityName")
     val resp = requestEntity(DELETE, path)(wp)
     val r = new RestResult(resp.status, getRespData(resp))
@@ -261,53 +257,43 @@ class WskRestAction
     expectedExitCode: Int = OK.intValue)(implicit wp: WskProps): RestResult = {
 
     val (namespace, actName) = getNamespaceEntityName(name)
-    var exec = Map[String, JsValue]()
-    var code = ""
-    var kindType = ""
-    var artifactName = ""
-    artifact match {
+    val (kindTypeByAction, code, artifactName) = artifact match {
       case Some(artifactFile) => {
         val ext = getExt(artifactFile)
-        artifactName = artifactFile
         ext match {
           case ".jar" => {
-            kindType = "java:default"
             val jar = FileUtils.readFileToByteArray(new File(artifactFile))
-            code = Base64.getEncoder.encodeToString(jar)
+            ("java:default", Base64.getEncoder.encodeToString(jar), artifactFile)
           }
           case ".zip" => {
             val zip = FileUtils.readFileToByteArray(new File(artifactFile))
-            code = Base64.getEncoder.encodeToString(zip)
+            ("", Base64.getEncoder.encodeToString(zip), artifactFile)
           }
           case ".js" => {
-            kindType = "nodejs:default"
-            code = FileUtils.readFileToString(new File(artifactFile))
+            ("nodejs:default", FileUtils.readFileToString(new File(artifactFile), StandardCharsets.UTF_8), artifactFile)
           }
           case ".py" => {
-            kindType = "python:default"
-            code = FileUtils.readFileToString(new File(artifactFile))
+            ("python:default", FileUtils.readFileToString(new File(artifactFile), StandardCharsets.UTF_8), artifactFile)
           }
           case ".swift" => {
-            kindType = "swift:default"
-            code = FileUtils.readFileToString(new File(artifactFile))
+            ("swift:default", FileUtils.readFileToString(new File(artifactFile), StandardCharsets.UTF_8), artifactFile)
           }
           case ".php" => {
-            kindType = "php:default"
-            code = FileUtils.readFileToString(new File(artifactFile))
+            ("php:default", FileUtils.readFileToString(new File(artifactFile), StandardCharsets.UTF_8), artifactFile)
           }
-          case _ =>
+          case _ => ("", "", artifactFile)
         }
       }
-      case None =>
+      case None => ("", "", "")
     }
 
-    kindType = docker map { d =>
+    val kindType = docker map { d =>
       "blackbox"
-    } getOrElse kindType
+    } getOrElse kindTypeByAction
 
-    var (params, annos) = getParamsAnnos(parameters, annotations, parameterFile, annotationFile, web = web)
+    val (paramsInput, annosInput) = getParamsAnnos(parameters, annotations, parameterFile, annotationFile, web = web)
 
-    kind match {
+    val (params, annos, execByKind) = kind match {
       case Some(k) => {
         k match {
           case "copy" => {
@@ -318,27 +304,35 @@ class WskRestAction
               return new RestResult(NotFound)
             else {
               val result = new RestResult(resp.status, getRespData(resp))
-              params = JsArray(result.getFieldListJsObject("parameters"))
-              annos = JsArray(result.getFieldListJsObject("annotations"))
-              exec = result.getFieldJsObject("exec").fields
+              val params = result.getFieldListJsObject("parameters").toArray[JsValue]
+              val annos = result.getFieldListJsObject("annotations").toArray[JsValue]
+              val exec = result.getFieldJsObject("exec").fields
+              (params, annos, exec)
             }
           }
           case "sequence" => {
             val comps = convertIntoComponents(artifactName)
-            exec = Map("components" -> comps.toJson, "kind" -> k.toJson)
+            val exec =
+              if (comps.size > 0) Map("components" -> comps.toJson, "kind" -> k.toJson)
+              else
+                Map("kind" -> k.toJson)
+            (paramsInput, annosInput, exec)
           }
           case "native" => {
-            exec = Map("code" -> code.toJson, "kind" -> "blackbox".toJson, "image" -> "openwhisk/dockerskeleton".toJson)
+            val exec =
+              Map("code" -> code.toJson, "kind" -> "blackbox".toJson, "image" -> "openwhisk/dockerskeleton".toJson)
+            (paramsInput, annosInput, exec)
           }
           case _ => {
-            exec = Map("code" -> code.toJson, "kind" -> k.toJson)
+            val exec = Map("code" -> code.toJson, "kind" -> k.toJson)
+            (paramsInput, annosInput, exec)
           }
         }
       }
-      case None => exec = Map("code" -> code.toJson, "kind" -> kindType.toJson)
+      case None => (paramsInput, annosInput, Map("code" -> code.toJson, "kind" -> kindType.toJson))
     }
 
-    exec = exec ++ {
+    val exec = execByKind ++ {
       main map { m =>
         Map("main" -> m.toJson)
       } getOrElse Map[String, JsValue]()
@@ -348,39 +342,66 @@ class WskRestAction
       } getOrElse Map[String, JsValue]()
     }
 
-    var bodyContent = Map("name" -> name.toJson, "namespace" -> namespace.toJson)
+    val bodyHead = Map("name" -> name.toJson, "namespace" -> namespace.toJson)
 
-    if (update) {
-      kind match {
-        case Some(k) if (k == "sequence" || k == "native") => {
-          bodyContent = bodyContent ++ Map("exec" -> exec.toJson)
-        }
-        case _ =>
+    val (updateExistence, resultExistence) = update match {
+      case true => {
+        val (ns, entity) = getNamespaceEntityName(name)
+        val entPath = Path(s"$basePath/namespaces/$ns/$noun/$entity")
+        val resp = requestEntity(GET, entPath)(wp)
+        val result = if (resp == None) new RestResult(NotFound) else new RestResult(resp.status, getRespData(resp))
+        if (result.statusCode == NotFound) (false, result) else (true, result)
       }
+      case _ => (false, new RestResult(NotFound))
+    }
 
-      bodyContent = bodyContent ++ {
+    val bodyWithParamsAnnos = if (updateExistence) {
+      val oldAnnos = resultExistence.getFieldListJsObject("annotations")
+      val inputParams = convertMapIntoKeyValue(parameters)
+      val inputAnnos = convertMapIntoKeyValue(annotations, web = web, oldParams = oldAnnos.toList)
+
+      bodyHead ++ {
+        kind match {
+          case Some(k) if (k == "sequence" || k == "native") => {
+            Map("exec" -> exec.toJson)
+          }
+          case _ => Map[String, JsValue]()
+        }
+      } ++ {
         shared map { s =>
           Map("publish" -> s.toJson)
         } getOrElse Map[String, JsValue]()
-      }
-
-      val inputParams = convertMapIntoKeyValue(parameters)
-      if (inputParams.elements.size > 0) {
-        bodyContent = bodyContent ++ Map("parameters" -> params)
-      }
-      val inputAnnos = convertMapIntoKeyValue(annotations)
-      if (inputAnnos.elements.size > 0) {
-        bodyContent = bodyContent ++ Map("annotations" -> annos)
+      } ++ {
+        if (inputParams.size > 0) {
+          Map("parameters" -> params.toJson)
+        } else Map[String, JsValue]()
+      } ++ {
+        if (inputAnnos.size > 0) {
+          Map("annotations" -> inputAnnos.toJson)
+        } else Map[String, JsValue]()
       }
     } else {
-      bodyContent = bodyContent ++ Map("exec" -> exec.toJson, "parameters" -> params, "annotations" -> annos)
-
-      bodyContent = bodyContent ++ {
-        timeout map { t =>
-          Map("limits" -> JsObject("timeout" -> t.toMillis.toJson))
-        } getOrElse Map[String, JsValue]()
-      }
+      bodyHead ++ Map("exec" -> exec.toJson, "parameters" -> params.toJson, "annotations" -> annos.toJson)
     }
+
+    val limits = Map[String, JsValue]() ++ {
+      timeout map { t =>
+        Map("timeout" -> t.toMillis.toJson)
+      } getOrElse Map[String, JsValue]()
+    } ++ {
+      logsize map { log =>
+        Map("logs" -> log.toMB.toJson)
+      } getOrElse Map[String, JsValue]()
+    } ++ {
+      memory map { m =>
+        Map("memory" -> m.toMB.toJson)
+      } getOrElse Map[String, JsValue]()
+    }
+
+    val bodyContent =
+      if (!limits.isEmpty)
+        bodyWithParamsAnnos ++ Map("limits" -> limits.toJson)
+      else bodyWithParamsAnnos
 
     val path = Path(s"$basePath/namespaces/$namespace/$noun/$actName")
     val resp =
@@ -436,19 +457,19 @@ class WskRestTrigger
       val published = shared.getOrElse(false)
       bodyContent = JsObject(
         bodyContent.fields + ("publish" -> published.toJson,
-        "parameters" -> params, "annotations" -> annos))
+        "parameters" -> params.toJson, "annotations" -> annos.toJson))
     } else {
       bodyContent = shared map { s =>
         JsObject(bodyContent.fields + ("publish" -> s.toJson))
       } getOrElse bodyContent
 
       val inputParams = convertMapIntoKeyValue(parameters)
-      if (inputParams.elements.size > 0) {
-        bodyContent = JsObject(bodyContent.fields + ("parameters" -> params))
+      if (inputParams.size > 0) {
+        bodyContent = JsObject(bodyContent.fields + ("parameters" -> params.toJson))
       }
       val inputAnnos = convertMapIntoKeyValue(annotations)
-      if (inputAnnos.elements.size > 0) {
-        bodyContent = JsObject(bodyContent.fields + ("annotations" -> annos))
+      if (inputAnnos.size > 0) {
+        bodyContent = JsObject(bodyContent.fields + ("annotations" -> annos.toJson))
       }
     }
 
@@ -468,14 +489,16 @@ class WskRestTrigger
       var body: Map[String, JsValue] = Map(
         "lifecycleEvent" -> "CREATE".toJson,
         "triggerName" -> s"/$ns/$triggerName".toJson,
-        "authKey" -> s"${getAuthKey(wp)}".toJson)
+        "authKey" -> s"${wp.authKey}".toJson)
       body = body ++ parameters
       val resp = requestEntity(POST, path, paramMap, Some(body.toJson.toString()))
       val resultInvoke = new RestResult(resp.status, getRespData(resp))
-      expectedExitCode shouldBe resultInvoke.statusCode.intValue
+      if ((expectedExitCode != DONTCARE_EXIT) && (expectedExitCode != ANY_ERROR_EXIT))
+        expectedExitCode shouldBe resultInvoke.statusCode.intValue
       if (resultInvoke.statusCode != OK) {
         // Remove the trigger, because the feed failed to invoke.
         this.delete(triggerName)
+        new RestResult(NotFound)
       } else {
         result
       }
@@ -496,10 +519,10 @@ class WskRestTrigger
   override def fire(name: String,
                     parameters: Map[String, JsValue] = Map(),
                     parameterFile: Option[String] = None,
-                    expectedExitCode: Int = OK.intValue)(implicit wp: WskProps): RestResult = {
+                    expectedExitCode: Int = Accepted.intValue)(implicit wp: WskProps): RestResult = {
     val path = getNamePath(noun, name)
     val params = parameterFile map { l =>
-      val input = FileUtils.readFileToString(new File(l))
+      val input = FileUtils.readFileToString(new File(l), StandardCharsets.UTF_8)
       input.parseJson.convertTo[Map[String, JsValue]]
     } getOrElse parameters
     val resp =
@@ -543,7 +566,7 @@ class WskRestRule
       "publish" -> published.toJson,
       "name" -> name.toJson,
       "status" -> "".toJson,
-      "annotations" -> annos)
+      "annotations" -> annos.toJson)
 
     val resp =
       if (update) requestEntity(PUT, path, Map("overwrite" -> "true"), Some(bodyContent.toString))
@@ -603,13 +626,22 @@ class WskRestActivation extends RunWskRestCmd with HasActivationRest with WaitFo
    * @param duration exits console after duration
    * @param since (optional) time travels back to activation since given duration
    */
-  override def console(duration: Duration, since: Option[Duration] = None, expectedExitCode: Int = SUCCESS_EXIT)(
-    implicit wp: WskProps): RestResult = {
-    var sinceTime = System.currentTimeMillis()
-    sinceTime = since map { s =>
-      sinceTime - s.toMillis
-    } getOrElse sinceTime
-    waitForActivationConsole(duration, Instant.ofEpochMilli(sinceTime))
+  override def console(duration: Duration,
+                       since: Option[Duration] = None,
+                       expectedExitCode: Int = SUCCESS_EXIT,
+                       actionName: Option[String] = None)(implicit wp: WskProps): RestResult = {
+    require(duration > 1.second, "duration must be at least 1 second")
+    val sinceTime = {
+      val now = System.currentTimeMillis()
+      since map { s =>
+        now - s.toMillis
+      } getOrElse now
+    }
+
+    retry({
+      val result = listActivation(since = Some(Instant.ofEpochMilli(sinceTime)))(wp)
+      if (result.stdout != "[]") result else throw new Throwable()
+    }, (duration / 1.second).toInt, Some(1.second))
   }
 
   /**
@@ -722,7 +754,8 @@ class WskRestActivation extends RunWskRestCmd with HasActivationRest with WaitFo
   override def get(activationId: Option[String],
                    expectedExitCode: Int = OK.intValue,
                    fieldFilter: Option[String] = None,
-                   last: Option[Boolean] = None)(implicit wp: WskProps): RestResult = {
+                   last: Option[Boolean] = None,
+                   summary: Option[Boolean] = None)(implicit wp: WskProps): RestResult = {
     val r = activationId match {
       case Some(id) => {
         val resp = requestEntity(GET, getNamePath(noun, id))
@@ -760,12 +793,6 @@ class WskRestActivation extends RunWskRestCmd with HasActivationRest with WaitFo
       Right(_)
     } getOrElse Left(s"Cannot find activation id from '$activation'")
 
-  }
-
-  def waitForActivationConsole(totalWait: Duration = 30 seconds, sinceTime: Instant)(
-    implicit wp: WskProps): RestResult = {
-    Thread.sleep(totalWait.toMillis)
-    listActivation(since = Some(sinceTime))(wp)
   }
 
   override def logs(activationId: Option[String] = None,
@@ -884,7 +911,7 @@ class WskRestPackage
       val published = shared.getOrElse(false)
       bodyContent = JsObject(
         bodyContent.fields + ("publish" -> published.toJson,
-        "parameters" -> params, "annotations" -> annos))
+        "parameters" -> params.toJson, "annotations" -> annos.toJson))
     } else {
       if (shared != None)
         bodyContent = shared map { s =>
@@ -892,12 +919,12 @@ class WskRestPackage
         } getOrElse bodyContent
 
       val inputParams = convertMapIntoKeyValue(parameters)
-      if (inputParams.elements.size > 0) {
-        bodyContent = JsObject(bodyContent.fields + ("parameters" -> params))
+      if (inputParams.size > 0) {
+        bodyContent = JsObject(bodyContent.fields + ("parameters" -> params.toJson))
       }
       val inputAnnos = convertMapIntoKeyValue(annotations)
-      if (inputAnnos.elements.size > 0) {
-        bodyContent = JsObject(bodyContent.fields + ("annotations" -> annos))
+      if (inputAnnos.size > 0) {
+        bodyContent = JsObject(bodyContent.fields + ("annotations" -> annos.toJson))
       }
     }
 
@@ -927,7 +954,8 @@ class WskRestPackage
     val (ns, packageName) = this.getNamespaceEntityName(provider)
     val path = getNamePath(noun, name)
     val binding = JsObject("namespace" -> ns.toJson, "name" -> packageName.toJson)
-    val bodyContent = JsObject("binding" -> binding.toJson, "parameters" -> params, "annotations" -> annos)
+    val bodyContent =
+      JsObject("binding" -> binding.toJson, "parameters" -> params.toJson, "annotations" -> annos.toJson)
     val resp = requestEntity(PUT, path, Map("overwrite" -> "false"), Some(bodyContent.toString))
     val r = new RestResult(resp.status, getRespData(resp))
     validateStatusCode(expectedExitCode, r.statusCode.intValue)
@@ -957,11 +985,10 @@ class WskRestApi extends RunWskRestCmd with BaseApi {
     val r = action match {
       case Some(action) => {
         val (ns, actionName) = this.getNamespaceEntityName(action)
-        val actionUrl = s"${WhiskProperties.getApiHostForAction}/$basePath/web/$ns/default/$actionName.http"
-        val actionAuthKey = this.getAuthKey(wp)
+        val actionUrl = s"${WhiskProperties.getApiHostForAction}$basePath/web/$ns/default/$actionName.http"
+        val actionAuthKey = wp.authKey
         val testaction = Some(
-          ApiAction(name = actionName, namespace = ns, backendUrl = actionUrl, authkey = actionAuthKey))
-
+          new ApiAction(name = actionName, namespace = ns, backendUrl = actionUrl, authkey = actionAuthKey))
         val parms = Map[String, JsValue]() ++ { Map("namespace" -> ns.toJson) } ++ {
           basepath map { b =>
             Map("gatewayBasePath" -> b.toJson)
@@ -984,19 +1011,21 @@ class WskRestApi extends RunWskRestCmd with BaseApi {
           } getOrElse Map[String, JsValue]()
         } ++ {
           swagger map { s =>
-            val swaggerFile = FileUtils.readFileToString(new File(s))
+            val swaggerFile = FileUtils.readFileToString(new File(s), StandardCharsets.UTF_8)
             Map("swagger" -> swaggerFile.toJson)
           } getOrElse Map[String, JsValue]()
         }
 
-        val parm = Map[String, JsValue]("apidoc" -> JsObject(parms)) ++ { Map("__ow_user" -> ns.toJson) } ++ {
+        val spaceguid = if (wp.authKey.contains(":")) wp.authKey.split(":")(0) else wp.authKey
+
+        val parm = Map[String, JsValue]("apidoc" -> JsObject(parms)) ++ {
           responsetype map { r =>
             Map("responsetype" -> r.toJson)
           } getOrElse Map[String, JsValue]()
         } ++ {
           Map("accesstoken" -> wp.authKey.toJson)
         } ++ {
-          Map("spaceguid" -> wp.authKey.split(":")(0).toJson)
+          Map("spaceguid" -> spaceguid.toJson)
         }
 
         invokeAction(
@@ -1004,10 +1033,44 @@ class WskRestApi extends RunWskRestCmd with BaseApi {
           parameters = parm,
           blocking = true,
           result = true,
+          web = true,
           expectedExitCode = expectedExitCode)(wp)
       }
       case None => {
-        new RestResult(NotFound)
+        swagger match {
+          case Some(swaggerFile) => {
+            var file = ""
+            val fileName = swaggerFile.toString()
+            try {
+              file = FileUtils.readFileToString(new File(fileName), StandardCharsets.UTF_8)
+            } catch {
+              case e: Throwable =>
+                return new RestResult(
+                  NotFound,
+                  JsObject("error" -> s"Error reading swagger file '$fileName'".toJson).toString())
+            }
+            val parms = Map("namespace" -> s"${wp.namespace}".toJson, "swagger" -> file.toJson)
+            val parm = Map[String, JsValue]("apidoc" -> JsObject(parms)) ++ {
+              responsetype map { r =>
+                Map("responsetype" -> r.toJson)
+              } getOrElse Map[String, JsValue]()
+            } ++ {
+              Map("accesstoken" -> wp.authKey.toJson)
+            } ++ {
+              Map("spaceguid" -> wp.authKey.split(":")(0).toJson)
+            }
+            invokeAction(
+              name = "apimgmt/createApi",
+              parameters = parm,
+              blocking = true,
+              result = true,
+              web = true,
+              expectedExitCode = expectedExitCode)(wp)
+          }
+          case None => {
+            new RestResult(NotFound)
+          }
+        }
       }
     }
     r
@@ -1029,8 +1092,7 @@ class WskRestApi extends RunWskRestCmd with BaseApi {
                     expectedExitCode: Int = SUCCESS_EXIT,
                     cliCfgFile: Option[String] = None)(implicit wp: WskProps): RestResult = {
 
-    val parms = Map[String, JsValue]() ++
-      Map("__ow_user" -> wp.namespace.toJson) ++ {
+    val parms = Map[String, JsValue]() ++ {
       basepathOrApiName map { b =>
         Map("basepath" -> b.toJson)
       } getOrElse Map[String, JsValue]()
@@ -1047,11 +1109,13 @@ class WskRestApi extends RunWskRestCmd with BaseApi {
     } ++ {
       Map("spaceguid" -> wp.authKey.split(":")(0).toJson)
     }
+
     val rr = invokeAction(
       name = "apimgmt/getApi",
       parameters = parms,
       blocking = true,
       result = true,
+      web = true,
       expectedExitCode = OK.intValue)(wp)
     rr
   }
@@ -1068,8 +1132,7 @@ class WskRestApi extends RunWskRestCmd with BaseApi {
                    expectedExitCode: Int = SUCCESS_EXIT,
                    cliCfgFile: Option[String] = None,
                    format: Option[String] = None)(implicit wp: WskProps): RestResult = {
-    val parms = Map[String, JsValue]() ++
-      Map("__ow_user" -> wp.namespace.toJson) ++ {
+    val parms = Map[String, JsValue]() ++ {
       basepathOrApiName map { b =>
         Map("basepath" -> b.toJson)
       } getOrElse Map[String, JsValue]()
@@ -1084,6 +1147,7 @@ class WskRestApi extends RunWskRestCmd with BaseApi {
       parameters = parms,
       blocking = true,
       result = true,
+      web = true,
       expectedExitCode = OK.intValue)(wp)
     result
   }
@@ -1099,7 +1163,7 @@ class WskRestApi extends RunWskRestCmd with BaseApi {
                       operation: Option[String] = None,
                       expectedExitCode: Int = SUCCESS_EXIT,
                       cliCfgFile: Option[String] = None)(implicit wp: WskProps): RestResult = {
-    val parms = Map[String, JsValue]() ++ { Map("__ow_user" -> wp.namespace.toJson) } ++ {
+    val parms = Map[String, JsValue]() ++ {
       Map("basepath" -> basepathOrApiName.toJson)
     } ++ {
       relpath map { r =>
@@ -1120,17 +1184,9 @@ class WskRestApi extends RunWskRestCmd with BaseApi {
       parameters = parms,
       blocking = true,
       result = true,
+      web = true,
       expectedExitCode = expectedExitCode)(wp)
     return rr
-  }
-
-  def getApi(basepathOrApiName: String, params: Map[String, String] = Map(), expectedExitCode: Int = OK.intValue)(
-    implicit wp: WskProps): RestResult = {
-    val whiskUrl = Uri(WhiskProperties.getApiHostForAction)
-    val path = Path(s"/api/${wp.authKey.split(":")(0)}$basepathOrApiName/path")
-    val resp = requestEntity(GET, path, params, whiskUrl = whiskUrl)
-    val result = new RestResult(resp.status, getRespData(resp))
-    result
   }
 }
 
@@ -1138,16 +1194,23 @@ class RunWskRestCmd() extends FlatSpec with RunWskCmd with Matchers with ScalaFu
 
   implicit val config = PatienceConfig(100 seconds, 15 milliseconds)
   implicit val materializer = ActorMaterializer()
-  val whiskRestUrl = Uri(WhiskProperties.getApiHostForAction)
+  val idleTimeout = 90 seconds
+  val queueSize = 10
+  val maxOpenRequest = 1024
   val basePath = Path("/api/v1")
+  val systemNamespace = "whisk.system"
 
   val sslConfig = AkkaSSLConfig().mapSettings { s =>
-    s.withLoose(s.loose.withAcceptAnyCertificate(true).withDisableHostnameVerification(true))
+    s.withHostnameVerifierClass(classOf[AcceptAllHostNameVerifier].asInstanceOf[Class[HostnameVerifier]])
   }
+
   val connectionContext = new HttpsConnectionContext(SSL.nonValidatingContext, Some(sslConfig))
 
   def isStatusCodeExpected(expectedExitCode: Int, statusCode: Int): Boolean = {
-    return statusCode == expectedExitCode
+    if ((expectedExitCode != DONTCARE_EXIT) && (expectedExitCode != ANY_ERROR_EXIT))
+      statusCode == expectedExitCode
+    else
+      true
   }
 
   def validateStatusCode(expectedExitCode: Int, statusCode: Int) = {
@@ -1175,15 +1238,39 @@ class RunWskRestCmd() extends FlatSpec with RunWskCmd with Matchers with ScalaFu
       HttpEntity(ContentTypes.`application/json`, b)
     } getOrElse HttpEntity(ContentTypes.`application/json`, "")
     val request = HttpRequest(method, uri, List(Authorization(creds)), entity = entity)
+    val connectionPoolSettings =
+      ConnectionPoolSettings(actorSystem).withMaxOpenRequests(maxOpenRequest).withIdleTimeout(idleTimeout)
+    val pool = Http().cachedHostConnectionPoolHttps[Promise[HttpResponse]](
+      host = WhiskProperties.getApiHost,
+      connectionContext = connectionContext,
+      settings = connectionPoolSettings)
+    val queue = Source
+      .queue[(HttpRequest, Promise[HttpResponse])](queueSize, OverflowStrategy.dropNew)
+      .via(pool)
+      .toMat(Sink.foreach({
+        case ((Success(resp), p)) => p.success(resp)
+        case ((Failure(e), p))    => p.failure(e)
+      }))(Keep.left)
+      .run
 
-    Http().singleRequest(request, connectionContext)
+    val promise = Promise[HttpResponse]
+    val responsePromise = Promise[HttpResponse]()
+    queue.offer(request -> responsePromise).flatMap {
+      case QueueOfferResult.Enqueued => responsePromise.future
+      case QueueOfferResult.Dropped =>
+        Future.failed(new RuntimeException("Queue has overflowed. Please try again later."))
+      case QueueOfferResult.Failure(ex) => Future.failed(ex)
+      case QueueOfferResult.QueueClosed =>
+        Future.failed(
+          new RuntimeException("Queue was closed (pool shut down) while running the request. Please try again later."))
+    }
   }
 
   def requestEntity(method: HttpMethod,
                     path: Path,
                     params: Map[String, String] = Map(),
                     body: Option[String] = None,
-                    whiskUrl: Uri = whiskRestUrl)(implicit wp: WskProps): HttpResponse = {
+                    whiskUrl: Uri = Uri(""))(implicit wp: WskProps): HttpResponse = {
     val creds = getBasicHttpCredentials(wp)
     request(method, whiskUrl.withPath(path).withQuery(Uri.Query(params)), body, creds = creds).futureValue
   }
@@ -1197,17 +1284,12 @@ class RunWskRestCmd() extends FlatSpec with RunWskCmd with Matchers with ScalaFu
     }
   }
 
-  def getAuthKey(wp: WskProps): String = {
-    val authKey = wp.authKey.split(":")
-    s"${authKey(0)}:${authKey(1)}"
-  }
-
   def getParamsAnnos(parameters: Map[String, JsValue] = Map(),
                      annotations: Map[String, JsValue] = Map(),
                      parameterFile: Option[String] = None,
                      annotationFile: Option[String] = None,
                      feed: Option[String] = None,
-                     web: Option[String] = None): (JsArray, JsArray) = {
+                     web: Option[String] = None): (Array[JsValue], Array[JsValue]) = {
     val params = parameterFile map { pf =>
       convertStringIntoKeyValue(pf)
     } getOrElse convertMapIntoKeyValue(parameters)
@@ -1217,25 +1299,49 @@ class RunWskRestCmd() extends FlatSpec with RunWskCmd with Matchers with ScalaFu
     (params, annos)
   }
 
-  def convertStringIntoKeyValue(file: String, feed: Option[String] = None, web: Option[String] = None): JsArray = {
-    var paramsList = Vector[JsObject]()
-    val input = FileUtils.readFileToString(new File(file))
+  def convertStringIntoKeyValue(file: String,
+                                feed: Option[String] = None,
+                                web: Option[String] = None): Array[JsValue] = {
+    val input = FileUtils.readFileToString(new File(file), StandardCharsets.UTF_8)
     val in = input.parseJson.convertTo[Map[String, JsValue]]
     convertMapIntoKeyValue(in, feed, web)
   }
 
   def convertMapIntoKeyValue(params: Map[String, JsValue],
                              feed: Option[String] = None,
-                             web: Option[String] = None): JsArray = {
-    var paramsList = Vector[JsObject]()
-    params foreach { case (key, value) => paramsList :+= JsObject("key" -> key.toJson, "value" -> value.toJson) }
-    paramsList = feed map { f =>
-      paramsList :+ JsObject("key" -> "feed".toJson, "value" -> f.toJson)
-    } getOrElse paramsList
-    paramsList = web map { w =>
-      paramsList :+ JsObject("key" -> "web-export".toJson, "value" -> w.toJson)
-    } getOrElse paramsList
-    JsArray(paramsList)
+                             web: Option[String] = None,
+                             oldParams: List[JsObject] = List[JsObject]()): Array[JsValue] = {
+    val newParams =
+      params
+        .map { case (key, value) => JsObject("key" -> key.toJson, "value" -> value) } ++ feed.map(f =>
+        JsObject("key" -> "feed".toJson, "value" -> f.toJson))
+
+    val paramsList =
+      if (newParams.nonEmpty) newParams
+      else
+        oldParams
+    val webOpt = web.map {
+      case "true" | "yes" =>
+        Seq(
+          JsObject("key" -> "web-export".toJson, "value" -> true.toJson),
+          JsObject("key" -> "raw-http".toJson, "value" -> false.toJson),
+          JsObject("key" -> "final".toJson, "value" -> true.toJson))
+      case "false" | "no" =>
+        Seq(
+          JsObject("key" -> "web-export".toJson, "value" -> false.toJson),
+          JsObject("key" -> "raw-http".toJson, "value" -> false.toJson),
+          JsObject("key" -> "final".toJson, "value" -> false.toJson))
+      case "raw" =>
+        Seq(
+          JsObject("key" -> "web-export".toJson, "value" -> true.toJson),
+          JsObject("key" -> "raw-http".toJson, "value" -> true.toJson),
+          JsObject("key" -> "final".toJson, "value" -> true.toJson))
+      case _ =>
+        Seq()
+    }
+    (webOpt map { web =>
+      paramsList ++ web
+    } getOrElse paramsList).toArray
   }
 
   def entityName(name: String)(implicit wp: WskProps) = {
@@ -1245,19 +1351,25 @@ class RunWskRestCmd() extends FlatSpec with RunWskCmd with Matchers with ScalaFu
   }
 
   def fullEntityName(name: String)(implicit wp: WskProps) = {
-    val sep = "/"
-    if (name.startsWith(sep)) name
-    else s"/${wp.namespace}/$name"
+    name.split("/") match {
+      // Example: /namespace/package_name/entity_name
+      case Array(empty, namespace, packageName, entityName) if empty.isEmpty => s"/$namespace/$packageName/$entityName"
+      // Example: /namespace/entity_name
+      case Array(empty, namespace, entityName) if empty.isEmpty => s"/$namespace/$entityName"
+      // Example: namespace/package_name/entity_name
+      case Array(namespace, packageName, entityName) => s"/$namespace/$packageName/$entityName"
+      // Example: /namespace
+      case Array(empty, namespace) if empty.isEmpty => namespace
+      // Example: package_name/entity_name
+      case Array(packageName, entityName) if !packageName.isEmpty => s"/${wp.namespace}/$packageName/$entityName"
+      // Example: entity_name
+      case Array(entityName) => s"/${wp.namespace}/$name"
+      case _                 => s"/${wp.namespace}/$name"
+    }
   }
 
-  def convertIntoComponents(comps: String)(implicit wp: WskProps): JsArray = {
-    var paramsList = Vector[JsString]()
-    comps.split(",") foreach {
-      case (value) =>
-        val fullName = fullEntityName(value)
-        paramsList :+= JsString(fullName)
-    }
-    JsArray(paramsList)
+  def convertIntoComponents(comps: String)(implicit wp: WskProps): Array[JsValue] = {
+    comps.split(",").filter(_.nonEmpty).map(comp => fullEntityName(comp).toJson)
   }
 
   def getRespData(resp: HttpResponse): String = {
@@ -1277,8 +1389,10 @@ class RunWskRestCmd() extends FlatSpec with RunWskCmd with Matchers with ScalaFu
       case Array(empty, namespace, entityName) if empty.isEmpty => (namespace, entityName)
       // Example: namespace/package_name/entity_name
       case Array(namespace, packageName, entityName) => (namespace, s"$packageName/$entityName")
+      // Example: /namespace
+      case Array(empty, namespace) if empty.isEmpty => (namespace, "")
       // Example: package_name/entity_name
-      case Array(packageName, entityName) => (wp.namespace, s"$packageName/$entityName")
+      case Array(packageName, entityName) if !packageName.isEmpty => (wp.namespace, s"$packageName/$entityName")
       // Example: entity_name
       case Array(entityName) => (wp.namespace, entityName)
       case _                 => (wp.namespace, name)
@@ -1290,15 +1404,18 @@ class RunWskRestCmd() extends FlatSpec with RunWskCmd with Matchers with ScalaFu
                    parameterFile: Option[String] = None,
                    blocking: Boolean = false,
                    result: Boolean = false,
+                   web: Boolean = false,
                    expectedExitCode: Int = Accepted.intValue)(implicit wp: WskProps): RestResult = {
     val (ns, actName) = this.getNamespaceEntityName(name)
-    val path = Path(s"$basePath/namespaces/$ns/actions/$actName")
+    val path =
+      if (web) Path(s"$basePath/web/$systemNamespace/$actName.http")
+      else Path(s"$basePath/namespaces/$ns/actions/$actName")
     var paramMap = Map("blocking" -> blocking.toString, "result" -> result.toString)
     val input = parameterFile map { pf =>
-      Some(FileUtils.readFileToString(new File(pf)))
+      Some(FileUtils.readFileToString(new File(pf), StandardCharsets.UTF_8))
     } getOrElse Some(parameters.toJson.toString())
     val resp = requestEntity(POST, path, paramMap, input)
-    val r = new RestResult(resp.status.intValue, getRespData(resp))
+    val r = new RestResult(resp.status.intValue, getRespData(resp), blocking)
     // If the statusCode does not not equal to expectedExitCode, it is acceptable that the statusCode
     // equals to 200 for the case that either blocking or result is set to true.
     if (!isStatusCodeExpected(expectedExitCode, r.statusCode.intValue)) {
@@ -1393,8 +1510,8 @@ object RestResult {
     obj.fields.get(key).map(_.convertTo[Vector[JsObject]]).getOrElse(Vector(JsObject()))
   }
 
-  def convertStausCodeToExitCode(statusCode: StatusCode): Int = {
-    if (statusCode == OK)
+  def convertStausCodeToExitCode(statusCode: StatusCode, blocking: Boolean = false): Int = {
+    if ((statusCode == OK) || (!blocking && (statusCode == Accepted)))
       return 0
     if (statusCode.intValue < BadRequest.intValue) statusCode.intValue else statusCode.intValue - codeConversion
   }
@@ -1408,9 +1525,9 @@ object RestResult {
   }
 }
 
-class RestResult(var statusCode: StatusCode, var respData: String = "")
+class RestResult(var statusCode: StatusCode, var respData: String = "", blocking: Boolean = false)
     extends RunResult(
-      RestResult.convertStausCodeToExitCode(statusCode),
+      RestResult.convertStausCodeToExitCode(statusCode, blocking),
       respData,
       RestResult.convertHttpResponseToStderr(respData)) {
 
@@ -1441,11 +1558,11 @@ class RestResult(var statusCode: StatusCode, var respData: String = "")
   }
 }
 
-case class ApiAction(name: String,
-                     namespace: String,
-                     backendMethod: String = "POST",
-                     backendUrl: String,
-                     authkey: String) {
+class ApiAction(var name: String,
+                var namespace: String,
+                var backendMethod: String = "POST",
+                var backendUrl: String,
+                var authkey: String) {
   def toJson(): JsObject = {
     return JsObject(
       "name" -> name.toJson,

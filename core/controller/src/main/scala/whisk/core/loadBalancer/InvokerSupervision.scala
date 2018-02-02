@@ -19,30 +19,25 @@ package whisk.core.loadBalancer
 
 import java.nio.charset.StandardCharsets
 
-import scala.collection.mutable
-import scala.concurrent.Future
+import scala.collection.immutable
+import scala.concurrent.{Await, Future}
 import scala.concurrent.duration._
 import scala.util.Failure
 import scala.util.Success
 import org.apache.kafka.clients.producer.RecordMetadata
-import akka.actor.Actor
-import akka.actor.ActorRef
-import akka.actor.ActorRefFactory
-import akka.actor.FSM
+import akka.actor.{Actor, ActorRef, ActorRefFactory, FSM, Props}
 import akka.actor.FSM.CurrentState
 import akka.actor.FSM.SubscribeTransitionCallBack
 import akka.actor.FSM.Transition
-import akka.actor.Props
 import akka.pattern.pipe
 import akka.util.Timeout
-import whisk.common.AkkaLogging
-import whisk.common.LoggingMarkers
-import whisk.common.RingBuffer
-import whisk.common.TransactionId
+import whisk.common._
 import whisk.core.connector._
+import whisk.core.database.NoDocumentException
 import whisk.core.entitlement.Privilege
 import whisk.core.entity.ActivationId.ActivationIdGenerator
 import whisk.core.entity._
+import whisk.core.entity.types.EntityStore
 
 // Received events
 case object GetStatus
@@ -82,43 +77,34 @@ class InvokerPool(childFactory: (ActorRefFactory, InstanceId) => ActorRef,
   implicit val timeout = Timeout(5.seconds)
   implicit val ec = context.dispatcher
 
-  // State of the actor. It's important not to close over these
-  // references directly, so they don't escape the Actor.
-  val instanceToRef = mutable.Map[InstanceId, ActorRef]()
-  val refToInstance = mutable.Map[ActorRef, InstanceId]()
-  var status = IndexedSeq[(InstanceId, InvokerState)]()
+  // State of the actor. Mutable vars with immutable collections prevents closures or messages
+  // from leaking the state for external mutation
+  var instanceToRef = immutable.Map.empty[InstanceId, ActorRef]
+  var refToInstance = immutable.Map.empty[ActorRef, InstanceId]
+  var status = IndexedSeq[InvokerHealth]()
 
   def receive = {
     case p: PingMessage =>
-      val invoker = instanceToRef.getOrElseUpdate(p.instance, {
-        logging.info(this, s"registered a new invoker: invoker${p.instance.toInt}")(TransactionId.invokerHealth)
+      val invoker = instanceToRef.getOrElse(p.instance, registerInvoker(p.instance))
+      instanceToRef = instanceToRef.updated(p.instance, invoker)
 
-        status = padToIndexed(status, p.instance.toInt + 1, i => (InstanceId(i), Offline))
-
-        val ref = childFactory(context, p.instance)
-        ref ! SubscribeTransitionCallBack(self) // register for state change events
-
-        refToInstance.update(ref, p.instance)
-        ref
-      })
       invoker.forward(p)
 
     case GetStatus => sender() ! status
 
-    case msg: InvocationFinishedMessage => {
+    case msg: InvocationFinishedMessage =>
       // Forward message to invoker, if InvokerActor exists
-      instanceToRef.get(msg.invokerInstance).map(_.forward(msg))
-    }
+      instanceToRef.get(msg.invokerInstance).foreach(_.forward(msg))
 
     case CurrentState(invoker, currentState: InvokerState) =>
       refToInstance.get(invoker).foreach { instance =>
-        status = status.updated(instance.toInt, (instance, currentState))
+        status = status.updated(instance.toInt, new InvokerHealth(instance, currentState))
       }
       logStatus()
 
     case Transition(invoker, oldState: InvokerState, newState: InvokerState) =>
       refToInstance.get(invoker).foreach { instance =>
-        status = status.updated(instance.toInt, (instance, newState))
+        status = status.updated(instance.toInt, new InvokerHealth(instance, newState))
       }
       logStatus()
 
@@ -127,7 +113,7 @@ class InvokerPool(childFactory: (ActorRefFactory, InstanceId) => ActorRef,
   }
 
   def logStatus() = {
-    val pretty = status.map { case (instance, state) => s"${instance.toInt} -> $state" }
+    val pretty = status.map(i => s"${i.id.toInt} -> ${i.status}")
     logging.info(this, s"invoker status changed to ${pretty.mkString(", ")}")
   }
 
@@ -159,9 +145,67 @@ class InvokerPool(childFactory: (ActorRefFactory, InstanceId) => ActorRef,
 
   /** Pads a list to a given length using the given function to compute entries */
   def padToIndexed[A](list: IndexedSeq[A], n: Int, f: (Int) => A) = list ++ (list.size until n).map(f)
+
+  // Register a new invoker
+  def registerInvoker(instanceId: InstanceId): ActorRef = {
+    logging.info(this, s"registered a new invoker: invoker${instanceId.toInt}")(TransactionId.invokerHealth)
+
+    status = padToIndexed(status, instanceId.toInt + 1, i => new InvokerHealth(InstanceId(i), Offline))
+
+    val ref = childFactory(context, instanceId)
+
+    ref ! SubscribeTransitionCallBack(self) // register for state change events
+
+    refToInstance = refToInstance.updated(ref, instanceId)
+
+    ref
+  }
+
 }
 
 object InvokerPool {
+  private def createTestActionForInvokerHealth(db: EntityStore, action: WhiskAction): Future[Unit] = {
+    implicit val tid = TransactionId.loadbalancer
+    implicit val ec = db.executionContext
+    implicit val logging = db.logging
+
+    WhiskAction
+      .get(db, action.docid)
+      .flatMap { oldAction =>
+        WhiskAction.put(db, action.revision(oldAction.rev))(tid, notifier = None)
+      }
+      .recover {
+        case _: NoDocumentException => WhiskAction.put(db, action)(tid, notifier = None)
+      }
+      .map(_ => {})
+      .andThen {
+        case Success(_) => logging.info(this, "test action for invoker health now exists")
+        case Failure(e) => logging.error(this, s"error creating test action for invoker health: $e")
+      }
+  }
+
+  /**
+   * Prepares everything for the health protocol to work (i.e. creates a testaction)
+   *
+   * @param controllerInstance instance of the controller we run in
+   * @param entityStore store to write the action to
+   * @return throws an exception on failure to prepare
+   */
+  def prepare(controllerInstance: InstanceId, entityStore: EntityStore): Unit = {
+    InvokerPool
+      .healthAction(controllerInstance)
+      .map {
+        // Await the creation of the test action; on failure, this will abort the constructor which should
+        // in turn abort the startup of the controller.
+        a =>
+          Await.result(createTestActionForInvokerHealth(entityStore, a), 1.minute)
+      }
+      .orElse {
+        throw new IllegalStateException(
+          "cannot create test action for invoker health because runtime manifest is not valid")
+      }
+  }
+
   def props(f: (ActorRefFactory, InstanceId) => ActorRef,
             p: (ActivationMessage, InstanceId) => Future[RecordMetadata],
             pc: MessageConsumer) = {
@@ -179,7 +223,7 @@ object InvokerPool {
     new WhiskAction(
       namespace = healthActionIdentity.namespace.toPath,
       name = EntityName(s"invokerHealthTestAction${i.toInt}"),
-      exec = new CodeExecAsString(manifest, """function main(params) { return params; }""", None))
+      exec = CodeExecAsString(manifest, """function main(params) { return params; }""", None))
   }
 }
 
@@ -321,7 +365,6 @@ class InvokerActor(invokerInstance: InstanceId, controllerInstance: InstanceId) 
         user = InvokerPool.healthActionIdentity,
         // Create a new Activation ID for this activation
         activationId = new ActivationIdGenerator {}.make(),
-        activationNamespace = action.namespace,
         rootControllerIndex = controllerInstance,
         blocking = false,
         content = None)

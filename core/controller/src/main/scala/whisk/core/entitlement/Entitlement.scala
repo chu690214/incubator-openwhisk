@@ -18,6 +18,7 @@
 package whisk.core.entitlement
 
 import scala.collection.concurrent.TrieMap
+import scala.collection.immutable.Set
 import scala.concurrent.Future
 import scala.util.Failure
 import scala.util.Success
@@ -35,6 +36,8 @@ import whisk.core.WhiskConfig
 import whisk.core.controller.RejectRequest
 import whisk.core.entity._
 import whisk.core.loadBalancer.LoadBalancer
+import whisk.http.ErrorResponse
+import whisk.http.Messages
 import whisk.http.Messages._
 
 package object types {
@@ -45,7 +48,7 @@ package object types {
  * Resource is a type that encapsulates details relevant to identify a specific resource.
  * It may be an entire collection, or an element in a collection.
  *
- * @param ns the namespace the resource resides in
+ * @param namespace the namespace the resource resides in
  * @param collection the collection (e.g., actions, triggers) identifying a resource
  * @param entity an optional entity name that identifies a specific item in the collection
  * @param env an optional environment to bind to the resource during an activation
@@ -55,7 +58,8 @@ protected[core] case class Resource(namespace: EntityPath,
                                     entity: Option[String],
                                     env: Option[Parameters] = None) {
   def parent = collection.path + EntityPath.PATHSEP + namespace
-  def id = parent + (entity map { EntityPath.PATHSEP + _ } getOrElse (""))
+  def id = parent + entity.map(EntityPath.PATHSEP + _).getOrElse("")
+  def fqname = namespace.asString + entity.map(EntityPath.PATHSEP + _).getOrElse("")
   override def toString = id
 }
 
@@ -65,7 +69,9 @@ protected[core] object EntitlementProvider {
     WhiskConfig.actionInvokePerMinuteLimit -> null,
     WhiskConfig.actionInvokeConcurrentLimit -> null,
     WhiskConfig.triggerFirePerMinuteLimit -> null,
-    WhiskConfig.actionInvokeSystemOverloadLimit -> null)
+    WhiskConfig.actionInvokeSystemOverloadLimit -> null,
+    WhiskConfig.controllerInstances -> null,
+    WhiskConfig.controllerHighAvailability -> null)
 }
 
 /**
@@ -78,10 +84,36 @@ protected[core] abstract class EntitlementProvider(config: WhiskConfig, loadBala
 
   private implicit val executionContext = actorSystem.dispatcher
 
+  /**
+   * The number of controllers if HA is enabled, 1 otherwise
+   */
+  private val diviser = if (config.controllerHighAvailability) config.controllerInstances.toInt else 1
+
+  /**
+   * Allows 20% of additional requests on top of the limit to mitigate possible unfair round-robin loadbalancing between
+   * controllers
+   */
+  private val overcommit = if (config.controllerHighAvailability) 1.2 else 1
+
+  /**
+   * Adjust the throttles for a single controller with the diviser and the overcommit.
+   *
+   * @param originalThrottle The throttle that needs to be adjusted for this controller.
+   */
+  private def dilateThrottle(originalThrottle: Int): Int = {
+    Math.ceil((originalThrottle.toDouble / diviser.toDouble) * overcommit).toInt
+  }
+
   private val invokeRateThrottler =
-    new RateThrottler("actions per minute", config.actionInvokePerMinuteLimit.toInt, _.limits.invocationsPerMinute)
+    new RateThrottler(
+      "actions per minute",
+      dilateThrottle(config.actionInvokePerMinuteLimit.toInt),
+      _.limits.invocationsPerMinute.map(dilateThrottle))
   private val triggerRateThrottler =
-    new RateThrottler("triggers per minute", config.triggerFirePerMinuteLimit.toInt, _.limits.firesPerMinute)
+    new RateThrottler(
+      "triggers per minute",
+      dilateThrottle(config.triggerFirePerMinuteLimit.toInt),
+      _.limits.firesPerMinute.map(dilateThrottle))
   private val concurrentInvokeThrottler = new ActivationThrottler(
     loadBalancer,
     config.actionInvokeConcurrentLimit.toInt,
@@ -128,10 +160,10 @@ protected[core] abstract class EntitlementProvider(config: WhiskConfig, loadBala
    */
   protected[core] def checkThrottles(user: Identity)(implicit transid: TransactionId): Future[Unit] = {
 
-    logging.info(this, s"checking user '${user.subject}' has not exceeded activation quota")
+    logging.debug(this, s"checking user '${user.subject}' has not exceeded activation quota")
     checkSystemOverload(ACTIVATE)
-      .flatMap(_ => checkThrottleOverload(Future.successful(invokeRateThrottler.check(user))))
-      .flatMap(_ => checkThrottleOverload(concurrentInvokeThrottler.check(user)))
+      .flatMap(_ => checkThrottleOverload(Future.successful(invokeRateThrottler.check(user)), user))
+      .flatMap(_ => checkThrottleOverload(concurrentInvokeThrottler.check(user), user))
   }
 
   /**
@@ -154,6 +186,21 @@ protected[core] abstract class EntitlementProvider(config: WhiskConfig, loadBala
     implicit transid: TransactionId): Future[Unit] = check(user, right, Set(resource))
 
   /**
+   * Constructs a RejectRequest containing the forbidden resources.
+   *
+   * @param resources resources forbidden to access
+   * @return a RejectRequest with the appropriate message
+   */
+  private def unauthorizedOn(resources: Set[Resource])(implicit transid: TransactionId) = {
+    RejectRequest(
+      Forbidden,
+      Some(
+        ErrorResponse(
+          Messages.notAuthorizedtoAccessResource(resources.map(_.fqname).toSeq.sorted.toSet.mkString(", ")),
+          transid)))
+  }
+
+  /**
    * Checks if a subject has the right to access a set of resources. The entitlement may be implicit,
    * that is, inferred based on namespaces that a subject belongs to and the namespace of the
    * resource for example, or explicit. The implicit check is computed here. The explicit check
@@ -162,38 +209,46 @@ protected[core] abstract class EntitlementProvider(config: WhiskConfig, loadBala
    * @param user the subject identity to check rights for
    * @param right the privilege the subject is requesting (applies to the entire set of resources)
    * @param resources the set of resources the subject requests access to
+   * @param noThrottle ignore throttle limits
    * @return a promise that completes with success iff the subject is permitted to access all of the requested resources
    */
-  protected[core] def check(user: Identity, right: Privilege, resources: Set[Resource])(
+  protected[core] def check(user: Identity, right: Privilege, resources: Set[Resource], noThrottle: Boolean = false)(
     implicit transid: TransactionId): Future[Unit] = {
     val subject = user.subject
 
-    val entitlementCheck: Future[Boolean] = if (user.rights.contains(right)) {
+    val entitlementCheck: Future[Unit] = if (user.rights.contains(right)) {
       if (resources.nonEmpty) {
-        logging.info(this, s"checking user '$subject' has privilege '$right' for '${resources.mkString(",")}'")
-        checkSystemOverload(right)
-          .flatMap(_ => checkUserThrottle(user, right, resources))
-          .flatMap(_ => checkConcurrentUserThrottle(user, right, resources))
+        logging.debug(this, s"checking user '$subject' has privilege '$right' for '${resources.mkString(", ")}'")
+        val throttleCheck =
+          if (noThrottle) Future.successful(())
+          else
+            checkSystemOverload(right)
+              .flatMap(_ => checkUserThrottle(user, right, resources))
+              .flatMap(_ => checkConcurrentUserThrottle(user, right, resources))
+        throttleCheck
           .flatMap(_ => checkPrivilege(user, right, resources))
-      } else Future.successful(true)
+          .flatMap(checkedResources => {
+            val failedResources = checkedResources.filterNot(_._2)
+            if (failedResources.isEmpty) Future.successful(())
+            else Future.failed(unauthorizedOn(failedResources.map(_._1)))
+          })
+      } else Future.successful(())
     } else if (right != REJECT) {
-      logging.info(
+      logging.debug(
         this,
-        s"supplied authkey for user '$subject' does not have privilege '$right' for '${resources.mkString(",")}'")
-      Future.failed(RejectRequest(Forbidden))
+        s"supplied authkey for user '$subject' does not have privilege '$right' for '${resources.mkString(", ")}'")
+      Future.failed(unauthorizedOn(resources))
     } else {
-      Future.successful(false)
+      Future.failed(unauthorizedOn(resources))
     }
+
     entitlementCheck andThen {
-      case Success(r) if resources.nonEmpty =>
-        logging.info(this, if (r) "authorized" else "not authorized")
+      case Success(rs) =>
+        logging.debug(this, "authorized")
       case Failure(r: RejectRequest) =>
-        logging.info(this, s"not authorized: $r")
+        logging.debug(this, s"not authorized: $r")
       case Failure(t) =>
         logging.error(this, s"failed while checking entitlement: ${t.getMessage}")
-    } flatMap { isAuthorized =>
-      if (isAuthorized) Future.successful({})
-      else Future.failed(RejectRequest(Forbidden))
     }
   }
 
@@ -204,23 +259,21 @@ protected[core] abstract class EntitlementProvider(config: WhiskConfig, loadBala
    * and the referenced package.
    */
   protected def checkPrivilege(user: Identity, right: Privilege, resources: Set[Resource])(
-    implicit transid: TransactionId): Future[Boolean] = {
+    implicit transid: TransactionId): Future[Set[(Resource, Boolean)]] = {
     // check the default namespace first, bypassing additional checks if permitted
     val defaultNamespaces = Set(user.namespace.asString)
     implicit val es = this
 
-    Future
-      .sequence {
-        resources.map { resource =>
-          resource.collection.implicitRights(user, defaultNamespaces, right, resource) flatMap {
-            case true => Future.successful(true)
-            case false =>
-              logging.info(this, "checking explicit grants")
-              entitled(user.subject, right, resource)
-          }
+    Future.sequence {
+      resources.map { resource =>
+        resource.collection.implicitRights(user, defaultNamespaces, right, resource) flatMap {
+          case true => Future.successful(resource -> true)
+          case false =>
+            logging.debug(this, "checking explicit grants")
+            entitled(user.subject, right, resource).flatMap(b => Future.successful(resource -> b))
         }
       }
-      .map { _.forall(identity) }
+    }
   }
 
   /**
@@ -247,16 +300,16 @@ protected[core] abstract class EntitlementProvider(config: WhiskConfig, loadBala
    *
    * @param user the subject identity to check rights for
    * @param right the privilege, if ACTIVATE then check quota else return None
-   * @param resource the set of resources must contain at least one resource that can be activated else return None
+   * @param resources the set of resources must contain at least one resource that can be activated else return None
    * @return future completing successfully if user is below limits else failing with a rejection
    */
   private def checkUserThrottle(user: Identity, right: Privilege, resources: Set[Resource])(
     implicit transid: TransactionId): Future[Unit] = {
     if (right == ACTIVATE) {
       if (resources.exists(_.collection.path == Collection.ACTIONS)) {
-        checkThrottleOverload(Future.successful(invokeRateThrottler.check(user)))
+        checkThrottleOverload(Future.successful(invokeRateThrottler.check(user)), user)
       } else if (resources.exists(_.collection.path == Collection.TRIGGERS)) {
-        checkThrottleOverload(Future.successful(triggerRateThrottler.check(user)))
+        checkThrottleOverload(Future.successful(triggerRateThrottler.check(user)), user)
       } else Future.successful(())
     } else Future.successful(())
   }
@@ -269,21 +322,23 @@ protected[core] abstract class EntitlementProvider(config: WhiskConfig, loadBala
    *
    * @param user the subject identity to check rights for
    * @param right the privilege, if ACTIVATE then check quota else return None
-   * @param resource the set of resources must contain at least one resource that can be activated else return None
+   * @param resources the set of resources must contain at least one resource that can be activated else return None
    * @return future completing successfully if user is below limits else failing with a rejection
    */
   private def checkConcurrentUserThrottle(user: Identity, right: Privilege, resources: Set[Resource])(
     implicit transid: TransactionId): Future[Unit] = {
     if (right == ACTIVATE && resources.exists(_.collection.path == Collection.ACTIONS)) {
-      checkThrottleOverload(concurrentInvokeThrottler.check(user))
+      checkThrottleOverload(concurrentInvokeThrottler.check(user), user)
     } else Future.successful(())
   }
 
-  private def checkThrottleOverload(throttle: Future[RateLimit])(implicit transid: TransactionId): Future[Unit] = {
+  private def checkThrottleOverload(throttle: Future[RateLimit], user: Identity)(
+    implicit transid: TransactionId): Future[Unit] = {
     throttle.flatMap { limit =>
       if (limit.ok) {
         Future.successful(())
       } else {
+        logging.info(this, s"'${user.namespace}' has exceeded its throttle limit, ${limit.errorMsg}")
         Future.failed(RejectRequest(TooManyRequests, limit.errorMsg))
       }
     }
@@ -322,6 +377,10 @@ trait ReferencedEntities {
         }
         Set(triggerResource, actionResource).flatten
       case e: SequenceExec =>
+        e.components.map { c =>
+          Resource(c.path, Collection(Collection.ACTIONS), Some(c.name.asString))
+        }.toSet
+      case e: SequenceExecMetaData =>
         e.components.map { c =>
           Resource(c.path, Collection(Collection.ACTIONS), Some(c.name.asString))
         }.toSet

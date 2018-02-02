@@ -19,20 +19,16 @@ package whisk.core.invoker
 
 import java.nio.charset.StandardCharsets
 import java.time.Instant
-
 import scala.concurrent.Future
 import scala.concurrent.duration._
 import scala.util.Failure
 import scala.util.Success
-
 import org.apache.kafka.common.errors.RecordTooLargeException
-
 import akka.actor.ActorRefFactory
 import akka.actor.ActorSystem
 import akka.actor.Props
 import akka.stream.ActorMaterializer
 import spray.json._
-import spray.json.DefaultJsonProtocol._
 import whisk.common.Logging
 import whisk.common.LoggingMarkers
 import whisk.common.TransactionId
@@ -48,11 +44,12 @@ import whisk.core.containerpool.ContainerProxy
 import whisk.core.containerpool.PrewarmingConfig
 import whisk.core.containerpool.Run
 import whisk.core.containerpool.logging.LogStoreProvider
-import whisk.core.database.NoDocumentException
+import whisk.core.database._
 import whisk.core.entity._
 import whisk.core.entity.size._
 import whisk.http.Messages
 import whisk.spi.SpiLoader
+import akka.event.Logging.InfoLevel
 
 class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: MessageProducer)(
   implicit actorSystem: ActorSystem,
@@ -63,6 +60,7 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
   implicit val cfg = config
 
   private val logsProvider = SpiLoader.get[LogStoreProvider].logStore(actorSystem)
+  logging.info(this, s"LogStoreProvider: ${logsProvider.getClass}")
 
   /**
    * Factory used by the ContainerProxy to physically create a new container.
@@ -82,8 +80,7 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
         Map(
           "--cap-drop" -> Set("NET_RAW", "NET_ADMIN"),
           "--ulimit" -> Set("nofile=1024:1024"),
-          "--pids-limit" -> Set("1024"),
-          "--dns" -> config.invokerContainerDns.toSet) ++ logsProvider.containerParameters)
+          "--pids-limit" -> Set("1024")) ++ logsProvider.containerParameters)
   containerFactory.init()
   sys.addShutdownHook(containerFactory.cleanup())
 
@@ -97,7 +94,7 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
   val msgProvider = SpiLoader.get[MessagingProvider]
   val consumer = msgProvider.getConsumer(
     config,
-    "invokers",
+    topic,
     topic,
     maximumContainers,
     maxPollInterval = TimeLimit.MAX_DURATION + 1.minute)
@@ -133,9 +130,9 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
   /** Stores an activation in the database. */
   val store = (tid: TransactionId, activation: WhiskActivation) => {
     implicit val transid = tid
-    logging.info(this, "recording the activation result to the data store")
+    logging.debug(this, "recording the activation result to the data store")
     WhiskActivation.put(activationStore, activation)(tid, notifier = None).andThen {
-      case Success(id) => logging.info(this, s"recorded activation")
+      case Success(id) => logging.debug(this, s"recorded activation")
       case Failure(t)  => logging.error(this, s"failed to record activation")
     }
   }
@@ -168,13 +165,13 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
       .flatMap { msg =>
         implicit val transid = msg.transid
 
-        val start = transid.started(this, LoggingMarkers.INVOKER_ACTIVATION)
+        val start = transid.started(this, LoggingMarkers.INVOKER_ACTIVATION, logLevel = InfoLevel)
         val namespace = msg.action.path
         val name = msg.action.name
         val actionid = FullyQualifiedEntityName(namespace, name).toDocId.asDocInfo(msg.revision)
         val subject = msg.user.subject
 
-        logging.info(this, s"${actionid.id} $subject ${msg.activationId}")
+        logging.debug(this, s"${actionid.id} $subject ${msg.activationId}")
 
         // caching is enabled since actions have revision id and an updated
         // action will not hit in the cache due to change in the revision id;
@@ -201,14 +198,20 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
               // making this an application error. All other errors are considered system
               // errors and should cause the invoker to be considered unhealthy.
               val response = t match {
-                case _: NoDocumentException => ActivationResponse.applicationError(Messages.actionRemovedWhileInvoking)
-                case _                      => ActivationResponse.whiskError(Messages.actionRemovedWhileInvoking)
+                case _: NoDocumentException =>
+                  ActivationResponse.applicationError(Messages.actionRemovedWhileInvoking)
+                case _: DocumentTypeMismatchException | _: DocumentUnreadable =>
+                  ActivationResponse.whiskError(Messages.actionMismatchWhileInvoking)
+                case _ =>
+                  ActivationResponse.whiskError(Messages.actionFetchErrorWhileInvoking)
               }
               val now = Instant.now
-              val causedBy = if (msg.causedBySequence) Parameters("causedBy", "sequence".toJson) else Parameters()
+              val causedBy = if (msg.causedBySequence) {
+                Some(Parameters(WhiskActivation.causedByAnnotation, JsString(Exec.SEQUENCE)))
+              } else None
               val activation = WhiskActivation(
                 activationId = msg.activationId,
-                namespace = msg.activationNamespace,
+                namespace = msg.user.namespace.toPath,
                 subject = msg.user.subject,
                 cause = msg.cause,
                 name = msg.action.name,
@@ -218,7 +221,7 @@ class InvokerReactive(config: WhiskConfig, instance: InstanceId, producer: Messa
                 duration = Some(0),
                 response = response,
                 annotations = {
-                  Parameters("path", msg.action.toString.toJson) ++ causedBy
+                  Parameters(WhiskActivation.pathAnnotation, JsString(msg.action.asString)) ++ causedBy
                 })
 
               activationFeed ! MessageFeed.Processed

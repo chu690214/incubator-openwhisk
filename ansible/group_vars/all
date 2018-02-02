@@ -18,6 +18,8 @@ exclude_logs_from: []
 #   whisk_api_localhost_name_default (last)
 whisk_api_localhost_name_default: "localhost"
 
+hosts_dir: "{{ inventory_dir| default(env_hosts_dir) }}" 
+
 whisk:
   version:
     date: "{{ansible_date_time.iso8601}}"
@@ -29,70 +31,10 @@ whisk:
 #   defaultImageTag: the default image tag
 #   runtimes: set of language runtime families grouped by language (e.g., nodejs, python)
 #   blackboxes: list of pre-populated docker action images as "name" with optional "prefix" and "tag"
+#   bypassPullForLocalImages: optional, if true, allow images with a prefix that matches {{ docker.image.prefix }}
+#                             to skip docker pull in invoker even if the image is not part of the blackbox set
 #
-runtimesManifest: "{{ runtimes_manifest | default(runtimesManifestDefault) }}"
-
-runtimesManifestDefault:
-  defaultImagePrefix: "openwhisk"
-  defaultImageTag: "latest"
-  runtimes:
-    nodejs:
-    - kind: "nodejs"
-      image:
-        name: "nodejsaction"
-      deprecated: true
-    - kind: "nodejs:6"
-      default: true
-      image:
-        name: "nodejs6action"
-      deprecated: false
-    python:
-    - kind: "python"
-      image:
-        name: "python2action"
-      deprecated: false
-    - kind: "python:2"
-      default: true
-      image:
-        name: "python2action"
-      deprecated: false
-    - kind: "python:3"
-      image:
-        name: "python3action"
-      deprecated: false
-    swift:
-    - kind: "swift"
-      image:
-        name: "swiftaction"
-      deprecated: true
-    - kind: "swift:3"
-      image:
-        name: "swift3action"
-      deprecated: false
-    - kind: "swift:3.1.1"
-      default: true
-      image:
-        name: "action-swift-v3.1.1"
-      deprecated: false
-    java:
-    - kind: "java"
-      default: true
-      image:
-        name: "java8action"
-      deprecated: false
-      attached:
-        attachmentName: "jarfile"
-        attachmentType: "application/java-archive"
-      sentinelledLogs: false
-      requireMain: true
-    php:
-    - kind: "php:7.1"
-      default: true
-      deprecated: false
-      image:
-        name: "action-php-v7.1"
-  blackboxes:
-    - name: "dockerskeleton"
+runtimesManifest: "{{ runtimes_manifest | default(lookup('file', '{{ openwhisk_home }}/ansible/files/runtimes.json') | from_json) }}"
 
 limits:
   invocationsPerMinute: "{{ limit_invocations_per_minute | default(60) }}"
@@ -101,14 +43,20 @@ limits:
   firesPerMinute: "{{ limit_fires_per_minute | default(60) }}"
   sequenceMaxLength: "{{ limit_sequence_max_length | default(50) }}"
 
+controllerHostnameFromMap: "{{ groups['controllers'] | map('extract', hostvars, 'ansible_host') | list | first }}"
+controllerHostname: "{{ controllerHostnameFromMap | default(inventory_hostname) }}"
+
 # port means outer port
 controller:
+  dir:
+    become: "{{ controller_dir_become | default(false) }}"
+  confdir: "{{ config_root_dir }}/controller"
   basePort: 10001
   heap: "{{ controller_heap | default('2g') }}"
   arguments: "{{ controller_arguments | default('') }}"
   blackboxFraction: "{{ controller_blackbox_fraction | default(0.10) }}"
   instances: "{{ groups['controllers'] | length }}"
-  localBookkeeping: "{{ controller_local_bookkeeping | default('true') }}"
+  localBookkeeping: "{{ controller_local_bookkeeping | default('false') }}"
   akka:
     provider: cluster
     cluster:
@@ -117,39 +65,61 @@ controller:
       bindPort: 2551
       # at this moment all controllers are seed nodes
       seedNodes: "{{ groups['controllers'] | map('extract', hostvars, 'ansible_host') | list }}"
+  # We recommend to enable HA for the controllers only, if bookkeeping data are shared too. (localBookkeeping: false)
+  ha: "{{ controller_enable_ha | default(True) and groups['controllers'] | length > 1 }}"
+  loglevel: "{{ controller_loglevel | default(whisk_loglevel) | default('INFO') }}"
+  jmxremote:
+    jvmArgs:  "{% if inventory_hostname in groups['controllers'] %}
+    {{ jmx.jvmCommonArgs }} -Djava.rmi.server.hostname={{ controllerHostname }} -Dcom.sun.management.jmxremote.rmi.port={{ jmx.rmiBasePortController + groups['controllers'].index(inventory_hostname) }} -Dcom.sun.management.jmxremote.port={{ jmx.basePortController + groups['controllers'].index(inventory_hostname) }}
+    {% endif %}"
+
+jmx:
+  basePortController: 15000
+  rmiBasePortController: 16000
+  basePortInvoker: 17000
+  rmiBasePortInvoker: 18000
+  user: "{{ jmxuser | default('jmxuser') }}"
+  pass: "{{ jmxuser | default('jmxpass') }}"
+  jvmCommonArgs: "-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.local.only=false -Dcom.sun.management.jmxremote.authenticate=true -Dcom.sun.management.jmxremote.password.file=/root/jmxremote.password -Dcom.sun.management.jmxremote.access.file=/root/jmxremote.access"
+  enabled: "{{ jmxremote_enabled | default('true') }}"
+
+transactions:
+  stride: "{{ groups['controllers'] | length }}"
 
 registry:
   confdir: "{{ config_root_dir }}/registry"
 
 kafka:
-  version: 0.10.2.1
+  version: 0.11.0.1
   port: 9092
   ras:
-    port: 9093
+    port: 8093
   heap: "{{ kafka_heap | default('1g') }}"
-  topics:
-    completed:
-      segmentBytes: 536870912
-      retentionBytes: "{{ kafka_topics_completed_retentionBytes | default(1073741824) }}"
-      retentionMS: 3600000
-    health:
-      segmentBytes: 536870912
-      retentionBytes: "{{ kafka_topics_health_retentionBytes | default(1073741824) }}"
-      retentionMS: 3600000
-    invoker:
-      segmentBytes: 536870912
-      retentionBytes: "{{ kafka_topics_invoker_retentionBytes | default(1073741824) }}"
-      retentionMS: 172800000
-    cacheInvalidation:
-      segmentBytes: 536870912
-      retentionBytes: 1073741824
-      retentionMS: 300000
+  replicationFactor: "{{ kafka_replicationFactor | default((groups['kafkas']|length)|int) }}"
+
+kafka_connect_string: "{% set ret = [] %}\
+                       {% for host in groups['kafkas'] %}\
+                         {{ ret.append( hostvars[host].ansible_host + ':' + ((kafka.port+loop.index-1)|string) ) }}\
+                       {% endfor %}\
+                       {{ ret | join(',') }}"
 
 zookeeper:
   version: 3.4
   port: 2181
 
+zookeeper_connect_string: "{% set ret = [] %}\
+                           {% for host in groups['zookeepers'] %}\
+                             {{ ret.append( hostvars[host].ansible_host + ':' + ((zookeeper.port+loop.index-1)|string) ) }}\
+                           {% endfor %}\
+                           {{ ret | join(',') }}"
+
+invokerHostnameFromMap: "{{ groups['invokers'] | map('extract', hostvars, 'ansible_host') | list | first }}"
+invokerHostname: "{{ invokerHostnameFromMap | default(inventory_hostname) }}"
+
 invoker:
+  dir:
+    become: "{{ invoker_dir_become | default(false) }}"
+  confdir: "{{ config_root_dir }}/invoker"
   port: 12001
   heap: "{{ invoker_heap | default('2g') }}"
   arguments: "{{ invoker_arguments | default('') }}"
@@ -163,13 +133,20 @@ invoker:
   useRunc: "{{ invoker_use_runc | default(true) }}"
   docker:
     become: "{{ invoker_docker_become | default(false) }}"
+  loglevel: "{{ invoker_loglevel | default(whisk_loglevel) | default('INFO') }}"
+  jmxremote:
+    jvmArgs: "{% if inventory_hostname in groups['invokers'] %}
+    {{ jmx.jvmCommonArgs }} -Djava.rmi.server.hostname={{ invokerHostname }} -Dcom.sun.management.jmxremote.rmi.port={{ jmx.rmiBasePortInvoker + groups['invokers'].index(inventory_hostname) }} -Dcom.sun.management.jmxremote.port={{ jmx.basePortInvoker + groups['invokers'].index(inventory_hostname) }}
+    {% endif %}"
 
+userLogs:
+  spi: "{{ userLogs_spi | default('whisk.core.containerpool.logging.DockerToActivationLogStoreProvider') }}"
 
 nginx:
   confdir: "{{ config_root_dir }}/nginx"
   dir:
     become: "{{ nginx_dir_become | default(false) }}"
-  version: 1.11
+  version: "{{ nginx_version | default(1.11) }}"
   port:
     http: 80
     api: 443
@@ -184,6 +161,7 @@ nginx:
     verify_client: "{{ nginx_ssl_verify_client | default('off') }}"
   wpn:
     router: "{{ nginx_wpn_router | default('1') }}"
+  special_users: "{{ nginx_special_users | default('[]') }}"
 
 # These are the variables to define all database relevant settings.
 # The authKeys are the users, that are initially created to use OpenWhisk.
@@ -193,6 +171,7 @@ nginx:
 # The key db.whisk.auth is the name of the authentication database where all keys of all users are stored.
 # The db_prefix is defined for each environment on its own. The CouchDb credentials are also defined for each environment on its own.
 db:
+  instances: "{{ groups['db'] | length }}"
   authkeys:
   - guest
   - whisk.system
@@ -206,7 +185,7 @@ apigateway:
     api: 9000
     api_secure: 443
     mgmt: 9001
-  version: 0.8.2
+  version: 0.9.8
 
 redis:
   version: 3.2
@@ -216,7 +195,7 @@ linux:
   version: 4.4.0-31
 
 couchdb:
-  version: 2.0
+  version: 2.1
 
 docker:
   # The user to install docker for. Defaults to the ansible user if not set. This will be the user who is able to run
@@ -299,28 +278,24 @@ openwhisk_cli_tag: "{{ lookup('ini', 'git_tag section=openwhisk-cli file={{ open
 #
 
 openwhisk_cli:
-  installation_mode: local
+  installation_mode: "{{ cli_installation_mode | default('remote') }}"
   local:
     location: "{{ openwhisk_cli_home }}/bin"
+  remote:
+    name: OpenWhisk_CLI
+    dest_name: OpenWhisk_CLI
+    location: "https://github.com/apache/incubator-openwhisk-cli/releases/download/{{ openwhisk_cli_tag }}"
 
-# If you would like to use the remote mode, you can uncomment the following section.
-#  remote:
-#    name: OpenWhisk_CLI
-#    dest_name: OpenWhisk_CLI
-#    location: "https://github.com/apache/incubator-openwhisk-cli/releases/download/{{ openwhisk_cli_tag }}"
-
-# The list of operating systems for which openwhisk cli binaries are downloaded,
+# The list of operating systems and architectures for which openwhisk cli binaries are downloaded,
 # if the installation_mode is remote.
-cli_os:
-  - linux
-  - mac
-  - windows
-
-# The list of architectures for which openwhisk cli binaries are downloaded,
-# if the installation_mode is remote.
-cli_arch:
-  - amd64
-  - 386
+cli_os_arch:
+  - [ "linux", "amd64" ]
+  - [ "linux", "386" ]
+  - [ "linux", "s390x" ]
+  - [ "mac", "amd64" ]
+  - [ "mac", "386" ]
+  - [ "windows", "amd64" ]
+  - [ "windows", "386" ]
 
 # Controls access to log directories
 logs:
@@ -329,10 +304,9 @@ logs:
 
 # Metrics Configuration
 metrics:
-  log: 
-    enabled: "{{ metrics_log | default(true) }}"    
-  kamon: 
+  log:
+    enabled: "{{ metrics_log | default(true) }}"
+  kamon:
     enabled: "{{ metrics_kamon | default(false) }}"
     host: "{{ metrics_kamon_statsd_host | default('') }}"
     port: "{{ metrics_kamon_statsd_port | default('8125') }}"
-

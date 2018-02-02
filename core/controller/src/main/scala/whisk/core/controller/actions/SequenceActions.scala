@@ -63,7 +63,7 @@ protected[actions] trait SequenceActions {
   /** A method that knows how to invoke a single primitive action. */
   protected[actions] def invokeAction(
     user: Identity,
-    action: WhiskAction,
+    action: WhiskActionMetaData,
     payload: Option[JsObject],
     waitForResponse: Option[FiniteDuration],
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[Either[ActivationId, WhiskActivation]]
@@ -84,7 +84,7 @@ protected[actions] trait SequenceActions {
    */
   protected[actions] def invokeSequence(
     user: Identity,
-    action: WhiskAction,
+    action: WhiskActionMetaData,
     components: Vector[FullyQualifiedEntityName],
     payload: Option[JsObject],
     waitForOutermostResponse: Option[FiniteDuration],
@@ -123,7 +123,7 @@ protected[actions] trait SequenceActions {
     if (topmost) { // need to deal with blocking and closing connection
       waitForOutermostResponse
         .map { timeout =>
-          logging.info(this, s"invoke sequence blocking topmost!")
+          logging.debug(this, s"invoke sequence blocking topmost!")
           futureSeqResult.withAlternativeAfterTimeout(
             timeout,
             Future.successful(Left(seqActivationId), atomicActionsCount))
@@ -146,7 +146,7 @@ protected[actions] trait SequenceActions {
   private def completeSequenceActivation(seqActivationId: ActivationId,
                                          futureSeqResult: Future[SequenceAccounting],
                                          user: Identity,
-                                         action: WhiskAction,
+                                         action: WhiskActionMetaData,
                                          topmost: Boolean,
                                          start: Instant,
                                          cause: Option[ActivationId])(
@@ -174,9 +174,9 @@ protected[actions] trait SequenceActions {
    * Stores sequence activation to database.
    */
   private def storeSequenceActivation(activation: WhiskActivation)(implicit transid: TransactionId): Unit = {
-    logging.info(this, s"recording activation '${activation.activationId}'")
+    logging.debug(this, s"recording activation '${activation.activationId}'")
     WhiskActivation.put(activationStore, activation)(transid, notifier = None) onComplete {
-      case Success(id) => logging.info(this, s"recorded activation")
+      case Success(id) => logging.debug(this, s"recorded activation")
       case Failure(t) =>
         logging.error(
           this,
@@ -188,7 +188,7 @@ protected[actions] trait SequenceActions {
    * Creates an activation for a sequence.
    */
   private def makeSequenceActivation(user: Identity,
-                                     action: WhiskAction,
+                                     action: WhiskActionMetaData,
                                      activationId: ActivationId,
                                      accounting: SequenceAccounting,
                                      topmost: Boolean,
@@ -199,16 +199,14 @@ protected[actions] trait SequenceActions {
     // compute max memory
     val sequenceLimits = accounting.maxMemory map { maxMemoryAcrossActionsInSequence =>
       Parameters(
-        "limits",
+        WhiskActivation.limitsAnnotation,
         ActionLimits(action.limits.timeout, MemoryLimit(maxMemoryAcrossActionsInSequence MB), action.limits.logs).toJson)
-    } getOrElse (Parameters())
+    }
 
     // set causedBy if not topmost sequence
     val causedBy = if (!topmost) {
-      Parameters("causedBy", JsString("sequence"))
-    } else {
-      Parameters()
-    }
+      Some(Parameters(WhiskActivation.causedByAnnotation, JsString(Exec.SEQUENCE)))
+    } else None
 
     // create the whisk activation
     WhiskActivation(
@@ -223,9 +221,9 @@ protected[actions] trait SequenceActions {
       logs = accounting.finalLogs,
       version = action.version,
       publish = false,
-      annotations = Parameters("topmost", JsBoolean(topmost)) ++
-        Parameters("path", action.fullyQualifiedName(false).toString) ++
-        Parameters("kind", "sequence") ++
+      annotations = Parameters(WhiskActivation.topmostAnnotation, JsBoolean(topmost)) ++
+        Parameters(WhiskActivation.pathAnnotation, JsString(action.fullyQualifiedName(false).asString)) ++
+        Parameters(WhiskActivation.kindAnnotation, JsString(Exec.SEQUENCE)) ++
         causedBy ++
         sequenceLimits,
       duration = Some(accounting.duration))
@@ -248,7 +246,7 @@ protected[actions] trait SequenceActions {
    */
   private def invokeSequenceComponents(
     user: Identity,
-    seqAction: WhiskAction,
+    seqAction: WhiskActionMetaData,
     seqActivationId: ActivationId,
     inputPayload: Option[JsObject],
     components: Vector[FullyQualifiedEntityName],
@@ -264,7 +262,7 @@ protected[actions] trait SequenceActions {
     // This action/parameter resolution is done in futures; the execution starts as soon as the first component
     // is resolved.
     val resolvedFutureActions = resolveDefaultNamespace(components, user) map { c =>
-      WhiskAction.resolveActionAndMergeParameters(entityStore, c)
+      WhiskActionMetaData.resolveActionAndMergeParameters(entityStore, c)
     }
 
     // this holds the initial value of the accounting structure, including the input boxed as an ActivationResponse
@@ -314,7 +312,7 @@ protected[actions] trait SequenceActions {
    */
   private def invokeNextAction(
     user: Identity,
-    futureAction: Future[WhiskAction],
+    futureAction: Future[WhiskActionMetaData],
     accounting: SequenceAccounting,
     cause: Option[ActivationId])(implicit transid: TransactionId): Future[SequenceAccounting] = {
     futureAction.flatMap { action =>
@@ -327,7 +325,7 @@ protected[actions] trait SequenceActions {
       // invoke the action by calling the right method depending on whether it's an atomic action or a sequence
       val futureWhiskActivationTuple = action.toExecutableWhiskAction match {
         case None =>
-          val SequenceExec(components) = action.exec
+          val SequenceExecMetaData(components) = action.exec
           logging.info(this, s"sequence invoking an enclosed sequence $action")
           // call invokeSequence to invoke the inner sequence; this is a blocking activation by definition
           invokeSequence(

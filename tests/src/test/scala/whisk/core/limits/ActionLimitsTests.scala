@@ -17,6 +17,9 @@
 
 package whisk.core.limits
 
+import akka.http.scaladsl.model.StatusCodes.RequestEntityTooLarge
+import akka.http.scaladsl.model.StatusCodes.BadGateway
+
 import java.io.File
 import java.io.PrintWriter
 
@@ -29,9 +32,8 @@ import org.scalatest.junit.JUnitRunner
 import common.ActivationResult
 import common.TestHelpers
 import common.TestUtils
-import common.TestUtils.TOO_LARGE
 import common.WhiskProperties
-import common.Wsk
+import common.rest.WskRest
 import common.WskProps
 import common.WskTestHelpers
 import spray.json._
@@ -40,14 +42,13 @@ import whisk.core.entity.ActivationEntityLimit
 import whisk.core.entity.ActivationResponse
 import whisk.core.entity.Exec
 import whisk.core.entity.size._
-import whisk.core.entity.size.SizeString
 import whisk.http.Messages
 
 @RunWith(classOf[JUnitRunner])
 class ActionLimitsTests extends TestHelpers with WskTestHelpers {
 
   implicit val wskprops = WskProps()
-  val wsk = new Wsk()
+  val wsk = new WskRest
 
   val defaultDosAction = TestUtils.getTestActionFilename("timeout.js")
   val allowedActionDuration = 10 seconds
@@ -113,13 +114,30 @@ class ActionLimitsTests extends TestHelpers with WskTestHelpers {
       val run = wsk.action.invoke(name, Map("payload" -> attemptedSize.toBytes.toJson))
       withActivation(wsk.activation, run, totalWait = 120 seconds) { response =>
         val lines = response.logs.get
-        lines.last shouldBe Messages.truncateLogs(allowedSize)
-        (lines.length - 1) shouldBe (allowedSize.toBytes / bytesPerLine)
-        // dropping 39 characters (timestamp + stream name)
-        // then reform total string adding back newlines
-        val actual = lines.dropRight(1).map(_.drop(39)).mkString("", "\n", "\n").sizeInBytes.toBytes
-        actual shouldBe allowedSize.toBytes
+        lines.last should include(Messages.truncateLogs(allowedSize))
       }
+  }
+
+  it should s"successfully invoke an action with a payload close to the limit (${ActivationEntityLimit.MAX_ACTIVATION_ENTITY_LIMIT.toMB} MB)" in withAssetCleaner(
+    wskprops) { (wp, assetHelper) =>
+    val name = "TestActionCausingJustInBoundaryResult"
+    assetHelper.withCleaner(wsk.action, name) {
+      val actionName = TestUtils.getTestActionFilename("echo.js")
+      (action, _) =>
+        action.create(name, Some(actionName), timeout = Some(15.seconds))
+    }
+
+    val allowedSize = ActivationEntityLimit.MAX_ACTIVATION_ENTITY_LIMIT.toBytes
+
+    // Needs some bytes grace since activation message is not only the payload.
+    val args = Map("p" -> ("a" * (allowedSize - 700).toInt).toJson)
+    val rr = wsk.action.invoke(name, args, blocking = true, expectedExitCode = TestUtils.SUCCESS_EXIT)
+    val activation = wsk.parseJsonString(rr.respData).convertTo[ActivationResult]
+
+    activation.response.success shouldBe true
+
+    // The payload is echoed and thus the backchannel supports the limit as well.
+    activation.response.result shouldBe Some(args.toJson)
   }
 
   Seq(true, false).foreach { blocking =>
@@ -148,10 +166,10 @@ class ActionLimitsTests extends TestHelpers with WskTestHelpers {
 
       // this tests an active ack failure to post from invoker
       val args = Map("size" -> (allowedSize + 1).toJson, "char" -> "a".toJson)
-      val code = if (blocking) TestUtils.APP_ERROR else TestUtils.SUCCESS_EXIT
+      val code = if (blocking) BadGateway.intValue else TestUtils.ACCEPTED
       val rr = wsk.action.invoke(name, args, blocking = blocking, expectedExitCode = code)
       if (blocking) {
-        checkResponse(wsk.parseJsonString(rr.stderr).convertTo[ActivationResult])
+        checkResponse(wsk.parseJsonString(rr.respData).convertTo[ActivationResult])
       } else {
         withActivation(wsk.activation, rr, totalWait = 120 seconds) { checkResponse(_) }
       }
@@ -187,7 +205,7 @@ class ActionLimitsTests extends TestHelpers with WskTestHelpers {
     pw.close
 
     assetHelper.withCleaner(wsk.action, name, confirmDelete = false) { (action, _) =>
-      action.create(name, Some(actionCode.getAbsolutePath), expectedExitCode = TOO_LARGE)
+      action.create(name, Some(actionCode.getAbsolutePath), expectedExitCode = RequestEntityTooLarge.intValue)
     }
 
     actionCode.delete
@@ -267,13 +285,13 @@ class ActionLimitsTests extends TestHelpers with WskTestHelpers {
   it should "be aborted when exceeding its memory limits" in withAssetCleaner(wskprops) { (wp, assetHelper) =>
     val name = "TestNodeJsMemoryExceeding"
     assetHelper.withCleaner(wsk.action, name, confirmDelete = true) {
-      val allowedMemory = 256.megabytes
+      val allowedMemory = 128.megabytes
       val actionName = TestUtils.getTestActionFilename("memoryWithGC.js")
       (action, _) =>
         action.create(name, Some(actionName), memory = Some(allowedMemory))
     }
 
-    val run = wsk.action.invoke(name, Map("payload" -> 512.toJson))
+    val run = wsk.action.invoke(name, Map("payload" -> 256.toJson))
     withActivation(wsk.activation, run) {
       _.response.result.get.fields("error") shouldBe Messages.memoryExhausted.toJson
     }

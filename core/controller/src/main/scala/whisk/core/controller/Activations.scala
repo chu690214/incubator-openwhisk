@@ -19,30 +19,51 @@ package whisk.core.controller
 
 import java.time.Instant
 
+import scala.concurrent.Future
 import scala.language.postfixOps
-import scala.util.Failure
-import scala.util.Success
-import scala.util.Try
+import scala.util.{Failure, Success, Try}
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport.sprayJsonMarshaller
 import akka.http.scaladsl.model.StatusCodes.BadRequest
 import akka.http.scaladsl.server.Directives
 import akka.http.scaladsl.unmarshalling._
-import scala.concurrent.Future
 import spray.json._
 import spray.json.DefaultJsonProtocol.RootJsObjectFormat
-import spray.json.DeserializationException
 import whisk.common.TransactionId
 import whisk.core.containerpool.logging.LogStore
+import whisk.core.controller.RestApiCommons.ListLimit
 import whisk.core.database.StaleParameter
-import whisk.core.entitlement.{Collection, Privilege, Resource}
 import whisk.core.entitlement.Privilege.READ
+import whisk.core.entitlement.{Collection, Privilege, Resource}
 import whisk.core.entity._
 import whisk.core.entity.types.ActivationStore
 import whisk.http.ErrorResponse.terminate
 import whisk.http.Messages
 
 object WhiskActivationsApi {
-  protected[core] val maxActivationLimit = 200
+
+  /** Custom unmarshaller for query parameters "name" into valid package/action name path. */
+  private implicit val stringToRestrictedEntityPath: Unmarshaller[String, Option[EntityPath]] =
+    Unmarshaller.strict[String, Option[EntityPath]] { value =>
+      Try { EntityPath(value) } match {
+        case Success(e) if e.segments <= 2 => Some(e)
+        case _ if value.trim.isEmpty       => None
+        case _                             => throw new IllegalArgumentException(Messages.badNameFilter(value))
+      }
+    }
+
+  /** Custom unmarshaller for query parameters "since" and "upto" into a valid Instant. */
+  private implicit val stringToInstantDeserializer: Unmarshaller[String, Instant] =
+    Unmarshaller.strict[String, Instant] { value =>
+      Try { Instant.ofEpochMilli(value.toLong) } match {
+        case Success(e) => e
+        case Failure(t) => throw new IllegalArgumentException(Messages.badEpoch(value))
+      }
+    }
+
+  /** Custom unmarshaller for query parameters "limit" for "list" operations. */
+  private implicit val stringToListLimit: Unmarshaller[String, ListLimit] =
+    RestApiCommons.stringToListLimit(Collection(Collection.ACTIVATIONS))
+
 }
 
 /** A trait implementing the activations API. */
@@ -118,26 +139,40 @@ trait WhiskActivationsApi extends Directives with AuthenticatedRouteProvider wit
    * - 500 Internal Server Error
    */
   private def list(namespace: EntityPath)(implicit transid: TransactionId) = {
+    import WhiskActivationsApi.stringToRestrictedEntityPath
+    import WhiskActivationsApi.stringToInstantDeserializer
+    import WhiskActivationsApi.stringToListLimit
+
     parameter(
       'skip ? 0,
-      'limit ? collection.listLimit,
+      'limit.as[ListLimit] ? ListLimit(collection.defaultListLimit),
       'count ? false,
       'docs ? false,
-      'name.as[EntityName] ?,
+      'name.as[Option[EntityPath]] ?,
       'since.as[Instant] ?,
       'upto.as[Instant] ?) { (skip, limit, count, docs, name, since, upto) =>
-      val cappedLimit = if (limit == 0) WhiskActivationsApi.maxActivationLimit else limit
-
-      // regardless of limit, cap at maxActivationLimit (200) records, client must paginate
-      if (cappedLimit <= WhiskActivationsApi.maxActivationLimit) {
-        val activations = name match {
+      if (count && !docs) {
+        countEntities {
+          WhiskActivation.countCollectionInNamespace(
+            activationStore,
+            name.flatten.map(p => namespace.addPath(p)).getOrElse(namespace),
+            skip,
+            since,
+            upto,
+            StaleParameter.UpdateAfter,
+            viewName = name.flatten.map(_ => WhiskActivation.filtersView).getOrElse(WhiskActivation.view))
+        }
+      } else if (count && docs) {
+        terminate(BadRequest, Messages.docsNotAllowedWithCount)
+      } else {
+        val activations = name.flatten match {
           case Some(action) =>
             WhiskActivation.listActivationsMatchingName(
               activationStore,
               namespace,
               action,
               skip,
-              cappedLimit,
+              limit.n,
               docs,
               since,
               upto,
@@ -147,18 +182,13 @@ trait WhiskActivationsApi extends Directives with AuthenticatedRouteProvider wit
               activationStore,
               namespace,
               skip,
-              cappedLimit,
+              limit.n,
               docs,
               since,
               upto,
               StaleParameter.UpdateAfter)
         }
-
-        listEntities {
-          activations map (_.fold((js) => js, (wa) => wa.map(_.toExtendedJson)))
-        }
-      } else {
-        terminate(BadRequest, Messages.maxActivationLimitExceeded(limit, WhiskActivationsApi.maxActivationLimit))
+        listEntities(activations map (_.fold((js) => js, (wa) => wa.map(_.toExtendedJson))))
       }
     }
   }
@@ -215,31 +245,4 @@ trait WhiskActivationsApi extends Directives with AuthenticatedRouteProvider wit
       docid,
       (activation: WhiskActivation) => logStore.fetchLogs(activation).map(_.toJsonObject))
   }
-
-  /** Custom unmarshaller for query parameters "name" into valid entity name. */
-  private implicit val stringToEntityName: Unmarshaller[String, EntityName] =
-    Unmarshaller.strict[String, EntityName] { value =>
-      Try { EntityName(value) } match {
-        case Success(e) => e
-        case Failure(t) => throw new IllegalArgumentException(Messages.badEntityName(value))
-      }
-    }
-
-  /** Custom unmarshaller for query parameters "name" into valid namespace. */
-  private implicit val stringToNamespace: Unmarshaller[String, EntityPath] =
-    Unmarshaller.strict[String, EntityPath] { value =>
-      Try { EntityPath(value) } match {
-        case Success(e) => e
-        case Failure(t) => throw new IllegalArgumentException(Messages.badNamespace(value))
-      }
-    }
-
-  /** Custom unmarshaller for query parameters "since" and "upto" into a valid Instant. */
-  private implicit val stringToInstantDeserializer: Unmarshaller[String, Instant] =
-    Unmarshaller.strict[String, Instant] { value =>
-      Try { Instant.ofEpochMilli(value.toLong) } match {
-        case Success(e) => e
-        case Failure(t) => throw new IllegalArgumentException(Messages.badEpoch(value))
-      }
-    }
 }

@@ -27,8 +27,7 @@ import akka.http.scaladsl.model._
 import akka.http.scaladsl.model.HttpRequest
 import akka.http.scaladsl.server._
 import akka.http.scaladsl.server.RouteResult.Rejected
-import akka.http.scaladsl.server.directives.DebuggingDirectives
-import akka.http.scaladsl.server.directives.LogEntry
+import akka.http.scaladsl.server.directives._
 import akka.stream.ActorMaterializer
 import spray.json._
 import whisk.common.LogMarker
@@ -44,15 +43,7 @@ import whisk.common.MetricEmitter
  */
 trait BasicHttpService extends Directives with TransactionCounter {
 
-  /** Rejection handler to terminate connection on a bad request. Delegates to Akka handler. */
-  implicit def customRejectionHandler(implicit transid: TransactionId) = {
-    RejectionHandler.default.mapRejectionResponse {
-      case res @ HttpResponse(_, _, ent: HttpEntity.Strict, _) =>
-        val error = ErrorResponse(ent.data.utf8String, transid).toJson
-        res.copy(entity = HttpEntity(ContentTypes.`application/json`, error.compactPrint))
-      case x => x
-    }
-  }
+  val OW_EXTRA_LOGGING_HEADER = "X-OW-EXTRA-LOGGING"
 
   /**
    * Gets the routes implemented by the HTTP service.
@@ -70,7 +61,7 @@ trait BasicHttpService extends Directives with TransactionCounter {
    */
   def loglevelForRoute(route: String): Logging.LogLevel = Logging.InfoLevel
 
-  /** Rejection handler to terminate connection on a bad request. Delegates to Akka handler. */
+  /** Prioritized rejections based on relevance. */
   val prioritizeRejections = recoverRejections { rejections =>
     val priorityRejection = rejections.find {
       case rejection: UnacceptedResponseContentTypeRejection => true
@@ -87,10 +78,12 @@ trait BasicHttpService extends Directives with TransactionCounter {
     assignId { implicit transid =>
       DebuggingDirectives.logRequest(logRequestInfo _) {
         DebuggingDirectives.logRequestResult(logResponseInfo _) {
-          handleRejections(customRejectionHandler) {
-            prioritizeRejections {
-              toStrictEntity(30.seconds) {
-                routes
+          BasicDirectives.mapRequest(_.removeHeader(OW_EXTRA_LOGGING_HEADER)) {
+            handleRejections(BasicHttpService.customRejectionHandler) {
+              prioritizeRejections {
+                toStrictEntity(30.seconds) {
+                  routes
+                }
               }
             }
           }
@@ -100,7 +93,16 @@ trait BasicHttpService extends Directives with TransactionCounter {
   }
 
   /** Assigns transaction id to every request. */
-  protected val assignId = extract(_ => transid())
+  protected def assignId = HeaderDirectives.optionalHeaderValueByName(OW_EXTRA_LOGGING_HEADER) flatMap { headerValue =>
+    val extraLogging = headerValue match {
+      // extract headers from HTTP request that indicates if additional logging should be enabled for this transaction.
+      // Passing "on" as header content will enable additional logging for this transaction,
+      // passing any other value will leave it as configured in the logging configuration
+      case Some(value) => value.toLowerCase == "on"
+      case None        => false
+    }
+    extract(_ => transid(extraLogging))
+  }
 
   /** Generates log entry for every request. */
   protected def logRequestInfo(req: HttpRequest)(implicit tid: TransactionId): LogEntry = {
@@ -124,6 +126,7 @@ trait BasicHttpService extends Directives with TransactionCounter {
 
       if (TransactionId.metricsKamon) {
         MetricEmitter.emitHistogramMetric(token, tid.deltaToStart)
+        MetricEmitter.emitCounterMetric(token)
       }
       if (TransactionId.metricsLog) {
         Some(LogEntry(s"[$tid] [$name] $marker", l))
@@ -150,4 +153,15 @@ object BasicHttpService {
       Await.result(actorSystem.whenTerminated, 30.seconds)
     }
   }
+
+  /** Rejection handler to terminate connection on a bad request. Delegates to Akka handler. */
+  def customRejectionHandler(implicit transid: TransactionId) = {
+    RejectionHandler.default.mapRejectionResponse {
+      case res @ HttpResponse(_, _, ent: HttpEntity.Strict, _) =>
+        val error = ErrorResponse(ent.data.utf8String, transid).toJson
+        res.copy(entity = HttpEntity(ContentTypes.`application/json`, error.compactPrint))
+      case x => x
+    }
+  }
+
 }

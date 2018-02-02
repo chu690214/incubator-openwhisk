@@ -19,6 +19,7 @@ package whisk.core.controller.test
 
 import java.time.Instant
 
+import scala.concurrent.duration.DurationInt
 import scala.language.postfixOps
 
 import org.junit.runner.RunWith
@@ -33,6 +34,7 @@ import spray.json._
 import spray.json.DefaultJsonProtocol._
 
 import whisk.core.controller.WhiskTriggersApi
+import whisk.core.entitlement.Collection
 import whisk.core.entity._
 import whisk.core.entity.WhiskRule
 import whisk.core.entity.size._
@@ -76,9 +78,7 @@ class TriggersApiTests extends ControllerTestCommon with WhiskTriggersApi {
       status should be(OK)
       val response = responseAs[List[JsObject]]
       triggers.length should be(response.length)
-      triggers forall { a =>
-        response contains a.summaryAsJson
-      } should be(true)
+      response should contain theSameElementsAs triggers.map(_.summaryAsJson)
     }
 
     // it should "list triggers with explicit namespace owned by subject" in {
@@ -86,15 +86,24 @@ class TriggersApiTests extends ControllerTestCommon with WhiskTriggersApi {
       status should be(OK)
       val response = responseAs[List[JsObject]]
       triggers.length should be(response.length)
-      triggers forall { a =>
-        response contains a.summaryAsJson
-      } should be(true)
+      response should contain theSameElementsAs triggers.map(_.summaryAsJson)
     }
 
     // it should "reject list triggers with explicit namespace not owned by subject" in {
     val auser = WhiskAuthHelpers.newIdentity()
     Get(s"/$namespace/${collection.path}") ~> Route.seal(routes(auser)) ~> check {
       status should be(Forbidden)
+    }
+  }
+
+  it should "reject list when limit is greater than maximum allowed value" in {
+    implicit val tid = transid()
+    val exceededMaxLimit = Collection.MAX_LIST_LIMIT + 1
+    val response = Get(s"$collectionPath?limit=$exceededMaxLimit") ~> Route.seal(routes(creds)) ~> check {
+      status should be(BadRequest)
+      responseAs[String] should include {
+        Messages.maxListLimitExceeded(Collection.TRIGGERS, exceededMaxLimit, Collection.MAX_LIST_LIMIT)
+      }
     }
   }
 
@@ -110,9 +119,7 @@ class TriggersApiTests extends ControllerTestCommon with WhiskTriggersApi {
       status should be(OK)
       val response = responseAs[List[WhiskTrigger]]
       triggers.length should be(response.length)
-      triggers forall { a =>
-        response contains a
-      } should be(true)
+      response should contain theSameElementsAs triggers.map(_.summaryAsJson)
     }
   }
 
@@ -316,17 +323,20 @@ class TriggersApiTests extends ControllerTestCommon with WhiskTriggersApi {
     val content = JsObject("xxx" -> "yyy".toJson)
     put(entityStore, trigger)
     Post(s"$collectionPath/${trigger.name}", content) ~> Route.seal(routes(creds)) ~> check {
-      status should be(OK)
+      status should be(Accepted)
       val response = responseAs[JsObject]
       val JsString(id) = response.fields("activationId")
       val activationId = ActivationId(id)
       response.fields("activationId") should not be None
 
       val activationDoc = DocId(WhiskEntity.qualifiedName(namespace, activationId))
-      val activation = get(activationStore, activationDoc, WhiskActivation, garbageCollect = false)
-      del(activationStore, DocId(WhiskEntity.qualifiedName(namespace, activationId)), WhiskActivation)
-      activation.end should be(Instant.EPOCH)
-      activation.response.result should be(Some(content))
+      whisk.utils.retry({
+        println(s"trying to obtain async activation doc: '${activationDoc}'")
+        val activation = get(activationStore, activationDoc, WhiskActivation, garbageCollect = false)
+        del(activationStore, activationDoc, WhiskActivation)
+        activation.end should be(Instant.EPOCH)
+        activation.response.result should be(Some(content))
+      }, 30, Some(1.second))
     }
   }
 
@@ -338,8 +348,12 @@ class TriggersApiTests extends ControllerTestCommon with WhiskTriggersApi {
       val response = responseAs[JsObject]
       val JsString(id) = response.fields("activationId")
       val activationId = ActivationId(id)
-      del(activationStore, DocId(WhiskEntity.qualifiedName(namespace, activationId)), WhiskActivation)
-      response.fields("activationId") should not be None
+      val activationDoc = DocId(WhiskEntity.qualifiedName(namespace, activationId))
+      whisk.utils.retry({
+        println(s"trying to delete async activation doc: '${activationDoc}'")
+        del(activationStore, activationDoc, WhiskActivation)
+        response.fields("activationId") should not be None
+      }, 30, Some(1.second))
     }
   }
 

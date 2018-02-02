@@ -17,50 +17,28 @@
 
 package whisk.core.controller
 
-import java.time.Clock
-import java.time.Instant
-
-import scala.concurrent.Future
-import scala.util.{Failure, Success}
+import java.time.{Clock, Instant}
 
 import akka.actor.ActorSystem
-import akka.stream.ActorMaterializer
-import akka.http.scaladsl.model.headers.BasicHttpCredentials
-import akka.http.scaladsl.model.HttpRequest
-import akka.http.scaladsl.model.StatusCodes._
-import akka.http.scaladsl.model.Uri
-import akka.http.scaladsl.model.Uri.Path
-import akka.http.scaladsl.server.RouteResult
-import akka.http.scaladsl.model.HttpMethods.POST
-import akka.http.scaladsl.model.headers.Authorization
-import akka.http.scaladsl.model.HttpMethods._
-import akka.http.scaladsl.model.MediaTypes
-import akka.http.scaladsl.model.HttpEntity
-import akka.http.scaladsl.server.RequestContext
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import akka.http.scaladsl.unmarshalling.Unmarshal
-
+import akka.http.scaladsl.model.HttpMethods.POST
+import akka.http.scaladsl.model.StatusCodes._
+import akka.http.scaladsl.model.{HttpEntity, HttpRequest, MediaTypes, Uri}
+import akka.http.scaladsl.model.Uri.Path
+import akka.http.scaladsl.model.headers.{Authorization, BasicHttpCredentials}
+import akka.http.scaladsl.server.{RequestContext, RouteResult}
+import akka.http.scaladsl.unmarshalling.{Unmarshal, Unmarshaller}
+import akka.stream.ActorMaterializer
 import spray.json._
-import spray.json.DefaultJsonProtocol.RootJsObjectFormat
-
 import whisk.common.TransactionId
+import whisk.core.controller.RestApiCommons.ListLimit
 import whisk.core.database.CacheChangeNotification
 import whisk.core.entitlement.Collection
-import whisk.core.entity.ActivationResponse
-import whisk.core.entity.EntityPath
-import whisk.core.entity.Parameters
-import whisk.core.entity.SemVer
-import whisk.core.entity.Status
-import whisk.core.entity.TriggerLimits
-import whisk.core.entity.WhiskActivation
-import whisk.core.entity.WhiskTrigger
-import whisk.core.entity.WhiskTriggerPut
-import whisk.core.entity.types.ActivationStore
-import whisk.core.entity.types.EntityStore
-import whisk.core.entity.Identity
-import whisk.core.entity.FullyQualifiedEntityName
-import whisk.http.ErrorResponse.terminate
+import whisk.core.entity._
+import whisk.core.entity.types.{ActivationStore, EntityStore}
+
+import scala.concurrent.Future
 
 /** A trait implementing the triggers API. */
 trait WhiskTriggersApi extends WhiskCollectionAPI {
@@ -143,9 +121,11 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
             response = ActivationResponse.success(payload orElse Some(JsObject())),
             version = trigger.version,
             duration = None)
-          logging.info(this, s"[POST] trigger activated, writing activation record to datastore: $triggerActivationId")
-          val saveTriggerActivation = WhiskActivation.put(activationStore, triggerActivation) map { _ =>
-            triggerActivationId
+
+          logging.debug(this, s"[POST] trigger activated, writing activation record to datastore: $triggerActivationId")
+          WhiskActivation.put(activationStore, triggerActivation) recover {
+            case t =>
+              logging.error(this, s"[POST] storing trigger activation $triggerActivationId failed: ${t.getMessage}")
           }
 
           val url = Uri(s"http://localhost:${whiskConfig.servicePort}")
@@ -155,19 +135,22 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
               case (ruleName, rule) => rule.status == Status.ACTIVE
             } foreach {
               case (ruleName, rule) =>
+                val ruleActivationId = activationIdFactory.make()
                 val ruleActivation = WhiskActivation(
                   namespace = user.namespace.toPath, // all activations should end up in the one space regardless trigger.namespace,
                   ruleName.name,
                   user.subject,
-                  activationIdFactory.make(),
+                  ruleActivationId,
                   Instant.now(Clock.systemUTC()),
                   Instant.EPOCH,
                   cause = Some(triggerActivationId),
                   response = ActivationResponse.success(),
                   version = trigger.version,
                   duration = None)
-                logging.info(this, s"[POST] rule ${ruleName} activated, writing activation record to datastore")
-                WhiskActivation.put(activationStore, ruleActivation)
+                WhiskActivation.put(activationStore, ruleActivation) recover {
+                  case t =>
+                    logging.error(this, s"[POST] storing rule activation $ruleActivationId failed: ${t.getMessage}")
+                }
 
                 val actionNamespace = rule.action.path.root.asString
                 val actionPath = {
@@ -195,7 +178,7 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
                         }
                       case NotFound =>
                         response.discardEntityBytes()
-                        logging.info(this, s"${rule.action} failed, action not found")
+                        logging.debug(this, s"${rule.action} failed, action not found")
                       case _ =>
                         Unmarshal(response.entity).to[String].map { error =>
                           logging.warn(this, s"${rule.action} failed due to $error")
@@ -205,13 +188,7 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
             }
           }
 
-          onComplete(saveTriggerActivation) {
-            case Success(activationId) =>
-              complete(OK, activationId.toJsObject)
-            case Failure(t: Throwable) =>
-              logging.error(this, s"[POST] storing trigger activation failed: ${t.getMessage}")
-              terminate(InternalServerError)
-          }
+          complete(Accepted, triggerActivationId.toJsObject)
       })
     }
   }
@@ -258,19 +235,21 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
    * - 200 [] or [WhiskTrigger as JSON]
    * - 500 Internal Server Error
    */
-  override def list(user: Identity, namespace: EntityPath, excludePrivate: Boolean)(implicit transid: TransactionId) = {
-    // for consistency, all the collections should support the same list API
-    // but because supporting docs on actions is difficult, the API does not
-    // offer an option to fetch entities with full docs yet; see comment in
-    // Actions API for more.
-    val docs = false
-    parameter('skip ? 0, 'limit ? collection.listLimit, 'count ? false) { (skip, limit, count) =>
-      listEntities {
-        WhiskTrigger.listCollectionInNamespace(entityStore, namespace, skip, limit, docs) map { list =>
-          val triggers = list.fold((js) => js, (ts) => ts.map(WhiskTrigger.serdes.write(_)))
-          FilterEntityList.filter(triggers, excludePrivate)
+  override def list(user: Identity, namespace: EntityPath)(implicit transid: TransactionId) = {
+    parameter('skip ? 0, 'limit.as[ListLimit] ? ListLimit(collection.defaultListLimit), 'count ? false) {
+      (skip, limit, count) =>
+        if (!count) {
+          listEntities {
+            WhiskTrigger.listCollectionInNamespace(entityStore, namespace, skip, limit.n, includeDocs = false) map {
+              list =>
+                list.fold((js) => js, (ts) => ts.map(WhiskTrigger.serdes.write(_)))
+            }
+          }
+        } else {
+          countEntities {
+            WhiskTrigger.countCollectionInNamespace(entityStore, namespace, skip)
+          }
         }
-      }
     }
   }
 
@@ -346,4 +325,7 @@ trait WhiskTriggersApi extends WhiskCollectionAPI {
   private def completeAsTriggerResponse(trigger: WhiskTrigger): RequestContext => Future[RouteResult] = {
     complete(OK, trigger.withoutRules)
   }
+
+  /** Custom unmarshaller for query parameters "limit" for "list" operations. */
+  private implicit val stringToListLimit: Unmarshaller[String, ListLimit] = RestApiCommons.stringToListLimit(collection)
 }

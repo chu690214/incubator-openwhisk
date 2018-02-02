@@ -17,35 +17,48 @@
 
 package whisk.core.containerpool.docker.test
 
+import akka.actor.ActorSystem
+
+import java.util.concurrent.Semaphore
+
 import scala.concurrent.Await
 import scala.concurrent.ExecutionContext
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
-import scala.concurrent.duration.DurationInt
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration._
 import scala.concurrent.Promise
 import scala.util.Success
 import org.junit.runner.RunWith
 import org.scalatest.BeforeAndAfterEach
+import org.scalatest.concurrent.Eventually
 import org.scalatest.FlatSpec
 import org.scalatest.junit.JUnitRunner
 import org.scalatest.Matchers
-import common.StreamLogging
+import org.scalatest.time.{Seconds, Span}
+import common.{StreamLogging, WskActorSystem}
 import whisk.common.LogMarker
 import whisk.common.LoggingMarkers.INVOKER_DOCKER_CMD
 import whisk.common.TransactionId
-import whisk.core.containerpool.docker.DockerClient
-import whisk.core.containerpool.ContainerId
 import whisk.core.containerpool.ContainerAddress
-import whisk.utils.retry
-import whisk.core.containerpool.docker.ProcessRunningException
-import whisk.core.containerpool.docker.DockerContainerId
+import whisk.core.containerpool.ContainerId
 import whisk.core.containerpool.docker.BrokenDockerContainer
+import whisk.core.containerpool.docker.DockerClient
+import whisk.core.containerpool.docker.DockerContainerId
+import whisk.core.containerpool.docker.ProcessRunningException
+import whisk.utils.retry
 
 @RunWith(classOf[JUnitRunner])
-class DockerClientTests extends FlatSpec with Matchers with StreamLogging with BeforeAndAfterEach {
+class DockerClientTests
+    extends FlatSpec
+    with Matchers
+    with StreamLogging
+    with BeforeAndAfterEach
+    with Eventually
+    with WskActorSystem {
 
   override def beforeEach = stream.reset()
+
+  implicit override val patienceConfig = PatienceConfig(timeout = scaled(Span(5, Seconds)))
 
   implicit val transid = TransactionId.testing
   val id = ContainerId("55db56ee082239428b27d3728b4dd324c09068458aad9825727d5bfc1bba6d52")
@@ -58,7 +71,8 @@ class DockerClientTests extends FlatSpec with Matchers with StreamLogging with B
   /** Returns a DockerClient with a mocked result for 'executeProcess' */
   def dockerClient(execResult: => Future[String]) = new DockerClient()(global) {
     override val dockerCmd = Seq(dockerCommand)
-    override def executeProcess(args: String*)(implicit ec: ExecutionContext) = execResult
+    override def executeProcess(args: Seq[String], timeout: Duration)(implicit ec: ExecutionContext, as: ActorSystem) =
+      execResult
   }
 
   behavior of "DockerContainerId"
@@ -167,6 +181,98 @@ class DockerClientTests extends FlatSpec with Matchers with StreamLogging with B
       Await.ready(dc.pull(image), commandTimeout)
       commandsRun shouldBe 2
     }
+  }
+
+  it should "limit the number of concurrent docker run invocations" in {
+    // Delay execution of Docker run command
+    val firstRunPromise = Promise[String]()
+
+    val firstContainerId = ContainerId("1" * 64)
+    val secondContainerId = ContainerId("2" * 64)
+
+    var runCmdCount = 0
+    val dc = new DockerClient()(global) {
+      override val dockerCmd = Seq(dockerCommand)
+      override def executeProcess(args: Seq[String], timeout: Duration)(implicit ec: ExecutionContext,
+                                                                        as: ActorSystem) = {
+        runCmdCount += 1
+        runCmdCount match {
+          case 1 => firstRunPromise.future
+          case 2 => Future.successful(secondContainerId.asString)
+          case _ => Future.failed(new Throwable())
+        }
+      }
+      // Need to override the semaphore, otherwise the tested code will still
+      // create the semaphore with the original value of maxParallelRuns.
+      override val maxParallelRuns = 1
+      override val runSemaphore = new Semaphore( /* permits= */ maxParallelRuns, /* fair= */ true)
+    }
+
+    val image = "image"
+    val args = Seq("args")
+
+    val firstRunResult = dc.run(image, args)
+    val secondRunResult = dc.run(image, args)
+
+    // The tested code won't reach the mocked executeProcess() and thus, increase runCmdCount,
+    // until at least one Future is successfully completed. For this reason, it takes
+    // some time until the following matcher is successful.
+    eventually { runCmdCount shouldBe 1 }
+
+    // Complete the first Docker run command so that the second is eligible to run
+    firstRunPromise.success(firstContainerId.asString)
+
+    // Cannot assert that the first Docker run always obtains the first container because
+    // the tested code uses Futures so that sequence may differ from test run to test run.
+    val firstResultContainerId = await(firstRunResult)
+
+    // Now, second command should be complete
+    eventually { runCmdCount shouldBe 2 }
+
+    val secondResultContainerId = await(secondRunResult)
+    Set(firstResultContainerId, secondResultContainerId) should contain theSameElementsAs Set(
+      firstContainerId,
+      secondContainerId)
+  }
+
+  it should "tolerate docker run errors when limiting the number of concurrent docker run invocations" in {
+    val secondContainerId = ContainerId("2" * 64)
+
+    var runCmdCount = 0
+    val dc = new DockerClient()(global) {
+      override val dockerCmd = Seq(dockerCommand)
+      override def executeProcess(args: Seq[String], timeout: Duration)(implicit ec: ExecutionContext,
+                                                                        as: ActorSystem) = {
+        runCmdCount += 1
+        println(s"runCmdCount=${runCmdCount}, args.last=${args.last}")
+        runCmdCount match {
+          case 1 => Future.failed(ProcessRunningException(1, "", ""))
+          case 2 => Future.successful(secondContainerId.asString)
+          case _ => Future.failed(new Throwable())
+        }
+      }
+      // Need to override the semaphore, otherwise the tested code will still
+      // create the semaphore with the original value of maxParallelRuns.
+      override val maxParallelRuns = 1
+      override val runSemaphore = new Semaphore( /* permits= */ maxParallelRuns, /* fair= */ true)
+    }
+
+    val image = "image"
+    val args = Seq("args")
+
+    // Kick off the first Docker run command - it will fail.
+    val firstRunResult = dc.run(image, args)
+
+    an[Exception] should be thrownBy await(firstRunResult)
+    runCmdCount shouldBe 1
+
+    // Now kick off the second Docker run command - it is expected to succeed.
+    // If this command completes without timeout, the concurrency limit properly
+    // deals with errors.
+    val secondRunResult = dc.run(image, args)
+
+    await(secondRunResult) shouldBe secondContainerId
+    runCmdCount shouldBe 2
   }
 
   it should "write proper log markers on a successful command" in {
