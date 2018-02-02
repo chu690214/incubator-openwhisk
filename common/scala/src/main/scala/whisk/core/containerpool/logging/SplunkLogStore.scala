@@ -100,8 +100,8 @@ class SplunkLogStore(
         "exec_mode" -> "oneshot",
         "search" -> search,
         "output_mode" -> "json",
-        "earliest_time" -> formatter.format(activation.start),
-        "latest_time" -> formatter.format(activation.end))).toEntity
+        "earliest_time" -> formatter.format(activation.start)
+      )).toEntity
 
     log.debug("sending request")
     queueRequest(
