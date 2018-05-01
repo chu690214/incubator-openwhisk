@@ -20,6 +20,7 @@ tasks.withType(Test) {
         showStandardStreams = true
         exceptionFormat = 'full'
     }
+    test.reports.junitXml.destination =  "$buildDir/test-results/${test.name}"
     outputs.upToDateWhen { false } // force tests to run every time
 }
 
