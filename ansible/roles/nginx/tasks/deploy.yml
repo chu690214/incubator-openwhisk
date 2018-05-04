@@ -20,6 +20,7 @@
   file:
     path: "{{ nginx.confdir }}"
     state: directory
+    mode: 0777
   become: "{{ nginx.dir.become }}"
 
 - name: copy template from local to remote in nginx config directory
