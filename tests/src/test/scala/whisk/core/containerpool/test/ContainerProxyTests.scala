@@ -182,7 +182,7 @@ class ContainerProxyTests
     Future.successful(())
   }
 
-  val poolConfig = ContainerPoolConfig(2.MB, false)
+  val poolConfig = ContainerPoolConfig(2.MB, 0.5, false)
 
   behavior of "ContainerProxy"
 
