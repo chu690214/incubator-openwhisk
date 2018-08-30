@@ -99,8 +99,6 @@ class InvokerReactive(
     }
   }
 
-  private val maximumContainers = poolConfig.maxActiveContainers
-
   /** Initialize message consumers */
   private val topic = s"invoker${instance.toInt}"
   private val maximumContainers = (poolConfig.userMemory / MemoryLimit.minMemory).toInt
