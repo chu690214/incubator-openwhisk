@@ -396,7 +396,6 @@ class ShardingContainerPoolBalancer(
         activationsPerNamespace.get(entry.namespaceId).foreach(_.decrement())
         //for concurrent activations, release the concurrency slots, after 0 release the invoker slot
         if (entry.maxConcurrent > 1) {
-          //println(s"getting m for ${invoker} ${schedulingState.containerSlots(entry.fullyQualifiedEntityName)}")
           val m = schedulingState.containerSlots(entry.fullyQualifiedEntityName)(invoker)
           if (m.release(1, true)) {
             schedulingState.invokerSlots.lift(invoker.toInt).foreach(_.release(entry.memory.toMB.toInt))
@@ -434,18 +433,6 @@ class ShardingContainerPoolBalancer(
     }
   }
 
-//  private val invokerPool = {
-//
-//    println(s"invoker pool producer ${messageProducer}")
-//    InvokerPool.prepare(controllerInstance, WhiskEntityStore.datastore())
-//
-//    actorSystem.actorOf(
-//      InvokerPool.props(
-//        (f, i) => f.actorOf(InvokerActor.props(i, controllerInstance)),
-//        (m, i) => sendActivationToInvoker(messageProducer, m, i),
-//        messagingProvider.getConsumer(config, s"health${controllerInstance.asString}", "health", maxPeek = 128),
-//        Some(monitor)))
-//  }
   private val invokerPool =
     invokerPoolFactory(actorSystem, messagingProvider, messageProducer, sendActivationToInvoker, Some(monitor))
 }
@@ -558,7 +545,6 @@ object ShardingContainerPoolBalancer extends LoadBalancerProvider {
             } else {
               dispatched(random.toInt).forceAcquire(slots)
             }
-            //concurrentSlots.map(_(random.toInt).release(5))
             logging.warn(this, s"system is overloaded. Chose invoker${random.toInt} by random assignment.")
             Some(random)
           } else {
@@ -660,15 +646,6 @@ case class ShardingContainerPoolBalancerState(
   def containerSlots: TrieMap[FullyQualifiedEntityName, TrieMap[InvokerInstanceId, ResizableSemaphore]] =
     _containerSlots
   def clusterSize: Int = _clusterSize
-
-//  def addContainer(action: ExecutableWhiskActionMetaData, fqn: FullyQualifiedEntityName): Unit = {
-//
-//    //either setup a semaphore with the proper number of permits
-//    //of increate the number of permits in the semaphore (via Semaphore.release())
-//    _containerSlots
-//      .getOrElseUpdate(fqn, IndexedSeq(new ResizableSemaphore(0)))
-//      .foreach(_.release(action.limits.concurrency.maxConcurrent - 1))
-//  }
 
   /**
    * Updates the scheduling state with the new invokers.
