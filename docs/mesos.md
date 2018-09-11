@@ -41,6 +41,8 @@ To set these properties for your invoker, set the corresponding environment vari
 ```properties
 CONFIG_whisk_spi_ContainerFactoryProvider=whisk.core.mesos.MesosContainerFactoryProvider
 CONFIG_whisk_mesos_masterUrl=http://192.168.99.100:5050
+CONFIG_whisk_mesos_constraints_0="att1 LIKE v1"
+CONFIG_whisk_mesos_constraints_1="att2 LIKE v2"
 ```
 
 ## Known Issues
