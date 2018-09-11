@@ -91,7 +91,7 @@ class ResizableSemaphore(maxAllowed: Int, reductionSize: Int) {
    */
   def release(acquires: Int = 1, reducing: Boolean = false): Boolean = {
     require(acquires > 0, "cannot release negative or no permits")
-    sync.tryReleaseSharedWithResult(acquires, reducing)
+    sync.tryReleaseSharedWithResult(acquires, true)
   }
 
   /** Returns the number of currently available permits. Possibly negative. */

@@ -18,7 +18,6 @@
 package whisk.common
 
 import java.util.concurrent.locks.AbstractQueuedSynchronizer
-
 import scala.annotation.tailrec
 
 /**
@@ -34,7 +33,7 @@ import scala.annotation.tailrec
  *
  * @param maxAllowed maximum number of permits given away by `tryAcquire`
  */
-class ForcibleSemaphore(maxAllowed: Int) {
+class ForcibleSemaphore[T](maxAllowed: Int) {
   class Sync extends AbstractQueuedSynchronizer {
     setState(maxAllowed)
 
@@ -60,13 +59,15 @@ class ForcibleSemaphore(maxAllowed: Int) {
      * order, hence this method is not necessarily fair.
      */
     @tailrec
-    final def nonFairTryAcquireShared(acquires: Int): Int = {
+    final def nonFairTryAcquireShared(acquires: Int, retry: Boolean = true): Int = {
       val available = getState
       val remaining = available - acquires
       if (remaining < 0 || compareAndSetState(available, remaining)) {
         remaining
+      } else if (retry) {
+        nonFairTryAcquireShared(acquires, retry)
       } else {
-        nonFairTryAcquireShared(acquires)
+        -1 //failure
       }
     }
 
@@ -95,6 +96,10 @@ class ForcibleSemaphore(maxAllowed: Int) {
   def tryAcquire(acquires: Int = 1): Boolean = {
     require(acquires > 0, "cannot acquire negative or no permits")
     sync.nonFairTryAcquireShared(acquires) >= 0
+  }
+  def tryAcquireOnce(acquires: Int = 1): Boolean = {
+    require(acquires > 0, "cannot acquire negative or no permits")
+    sync.nonFairTryAcquireShared(acquires, false) >= 0
   }
 
   /**

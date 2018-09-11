@@ -32,15 +32,16 @@ import org.scalamock.scalatest.MockFactory
 import org.scalatest.junit.JUnitRunner
 import org.scalatest.FlatSpec
 import org.scalatest.Matchers
-import scala.collection.concurrent.TrieMap
+//import scala.collection.concurrent.TrieMap
 import scala.concurrent.Await
 import scala.concurrent.Future
 import scala.concurrent.duration._
 import spray.json.JsNumber
 import spray.json.JsObject
-import whisk.common.ForcibleSemaphore
 import whisk.common.Logging
-import whisk.common.ResizableSemaphore
+import whisk.common.NestedSemaphore
+//import whisk.common.ResizableSemaphore
+import whisk.core.entity.FullyQualifiedEntityName
 //import whisk.common.ResizableSemaphore
 import whisk.common.TransactionId
 import whisk.core.WhiskConfig
@@ -91,8 +92,8 @@ class ShardingContainerPoolBalancerTests
   def unhealthy(i: Int) = new InvokerHealth(InvokerInstanceId(i), Unhealthy)
   def offline(i: Int) = new InvokerHealth(InvokerInstanceId(i), Offline)
 
-  def semaphores(count: Int, max: Int): IndexedSeq[ForcibleSemaphore] =
-    IndexedSeq.fill(count)(new ForcibleSemaphore(max))
+  def semaphores(count: Int, max: Int): IndexedSeq[NestedSemaphore[FullyQualifiedEntityName]] =
+    IndexedSeq.fill(count)(new NestedSemaphore[FullyQualifiedEntityName](max))
 
   def lbConfig(blackboxFraction: Double, invokerBusyThreshold: ByteSize) =
     ShardingContainerPoolBalancerConfig(blackboxFraction, invokerBusyThreshold, 1)
@@ -213,6 +214,9 @@ class ShardingContainerPoolBalancerTests
 
     state.invokerSlots.head.availablePermits shouldBe MemoryLimit.minMemory.toMB
   }
+  val namespace = EntityPath("testspace")
+  val name = EntityName("testname")
+  val fqn = FullyQualifiedEntityName(namespace, name)
 
   behavior of "schedule"
 
@@ -221,8 +225,8 @@ class ShardingContainerPoolBalancerTests
   it should "return None on an empty invoker list" in {
     ShardingContainerPoolBalancer.schedule(
       1,
+      fqn,
       IndexedSeq.empty,
-      None,
       IndexedSeq.empty,
       MemoryLimit.minMemory.toMB.toInt,
       index = 0,
@@ -236,8 +240,8 @@ class ShardingContainerPoolBalancerTests
 
     ShardingContainerPoolBalancer.schedule(
       1,
+      fqn,
       invokers,
-      None,
       invokerSlots,
       MemoryLimit.minMemory.toMB.toInt,
       index = 0,
@@ -252,7 +256,7 @@ class ShardingContainerPoolBalancerTests
     val expectedResult = Seq(3, 3, 3, 5, 5, 5, 4, 4, 4)
     val result = expectedResult.map { _ =>
       ShardingContainerPoolBalancer
-        .schedule(1, invokers, None, invokerSlots, 1, index = 0, step = 2)
+        .schedule(1, fqn, invokers, invokerSlots, 1, index = 0, step = 2)
         .get
         .toInt
     }
@@ -261,7 +265,7 @@ class ShardingContainerPoolBalancerTests
 
     val bruteResult = (0 to 100).map { _ =>
       ShardingContainerPoolBalancer
-        .schedule(1, invokers, None, invokerSlots, 1, index = 0, step = 2)
+        .schedule(1, fqn, invokers, invokerSlots, 1, index = 0, step = 2)
         .get
         .toInt
     }
@@ -276,7 +280,7 @@ class ShardingContainerPoolBalancerTests
     val expectedResult = Seq(0, 0, 0, 3, 3, 3)
     val result = expectedResult.map { _ =>
       ShardingContainerPoolBalancer
-        .schedule(1, invokers, None, invokerSlots, 1, index = 0, step = 1)
+        .schedule(1, fqn, invokers, invokerSlots, 1, index = 0, step = 1)
         .get
         .toInt
     }
@@ -285,7 +289,7 @@ class ShardingContainerPoolBalancerTests
 
     // more schedules will result in randomized invokers, but the unhealthy and offline invokers should not be part
     val bruteResult = (0 to 100).map { _ =>
-      ShardingContainerPoolBalancer.schedule(1, invokers, None, invokerSlots, 1, index = 0, step = 1).get.toInt
+      ShardingContainerPoolBalancer.schedule(1, fqn, invokers, invokerSlots, 1, index = 0, step = 1).get.toInt
     }
 
     bruteResult should contain allOf (0, 3)
@@ -299,15 +303,15 @@ class ShardingContainerPoolBalancerTests
     val invokers = (0 until invokerCount).map(i => healthy(i))
 
     // Ask for three slots -> First invoker should be used
-    ShardingContainerPoolBalancer.schedule(1, invokers, None, invokerSlots, 3, index = 0, step = 1).get.toInt shouldBe 0
+    ShardingContainerPoolBalancer.schedule(1, fqn, invokers, invokerSlots, 3, index = 0, step = 1).get.toInt shouldBe 0
     // Ask for two slots -> Second invoker should be used
-    ShardingContainerPoolBalancer.schedule(1, invokers, None, invokerSlots, 2, index = 0, step = 1).get.toInt shouldBe 1
+    ShardingContainerPoolBalancer.schedule(1, fqn, invokers, invokerSlots, 2, index = 0, step = 1).get.toInt shouldBe 1
     // Ask for 1 slot -> First invoker should be used
-    ShardingContainerPoolBalancer.schedule(1, invokers, None, invokerSlots, 1, index = 0, step = 1).get.toInt shouldBe 0
+    ShardingContainerPoolBalancer.schedule(1, fqn, invokers, invokerSlots, 1, index = 0, step = 1).get.toInt shouldBe 0
     // Ask for 4 slots -> Third invoker should be used
-    ShardingContainerPoolBalancer.schedule(1, invokers, None, invokerSlots, 4, index = 0, step = 1).get.toInt shouldBe 2
+    ShardingContainerPoolBalancer.schedule(1, fqn, invokers, invokerSlots, 4, index = 0, step = 1).get.toInt shouldBe 2
     // Ask for 2 slots -> Second invoker should be used
-    ShardingContainerPoolBalancer.schedule(1, invokers, None, invokerSlots, 2, index = 0, step = 1).get.toInt shouldBe 1
+    ShardingContainerPoolBalancer.schedule(1, fqn, invokers, invokerSlots, 2, index = 0, step = 1).get.toInt shouldBe 1
 
     invokerSlots.foreach(_.availablePermits shouldBe 0)
   }
@@ -335,27 +339,39 @@ class ShardingContainerPoolBalancerTests
     // Each invoker has 2 slots, each action has concurrency 3
     val slots = 2
     val invokerSlots = semaphores(invokerCount, slots)
-    val concurrentSlots = TrieMap.empty[InvokerInstanceId, ResizableSemaphore]
+//    val concurrentSlots = TrieMap.empty[InvokerInstanceId, ResizableSemaphore]
     val concurrency = 3
     val invokers = (0 until invokerCount).map(i => healthy(i))
 
-    val containersPer = 2
+    //val containersPer = 2
 
     (0 until invokerCount).foreach { i =>
-      (1 to slots).foreach { _ =>
+      (1 to slots).foreach { s =>
         (1 to concurrency).foreach { c =>
           ShardingContainerPoolBalancer
-            .schedule(concurrency, invokers, Some(concurrentSlots), invokerSlots, 1, 0, 1)
+            .schedule(concurrency, fqn, invokers, invokerSlots, 1, 0, 1)
             .get
             .toInt shouldBe i
-          concurrentSlots.get(InvokerInstanceId(i)).get.availablePermits shouldBe concurrency - c
+          //concurrentSlots.get(InvokerInstanceId(i)).get.availablePermits shouldBe concurrency - c
+          invokerSlots
+            .lift(i)
+            .get
+            .concurrentState(fqn.toString)
+            .availablePermits shouldBe concurrency - c
         }
       }
     }
-    //forced to a random invoker
-    val random = ShardingContainerPoolBalancer
-      .schedule(concurrency, invokers, Some(concurrentSlots), invokerSlots, 1, 0, 1)
-    concurrentSlots.get(random.get).get.availablePermits shouldBe concurrency - 1
+//    println("-------")
+//    //forced to a random invoker
+//    val random = ShardingContainerPoolBalancer
+//      .schedule(concurrency, fqn, invokers, invokerSlots, 1, 0, 1)
+//    //concurrentSlots.get(random.get).get.availablePermits shouldBe concurrency - 1
+//
+//    invokerSlots
+//      .lift(random.get.toInt)
+//      .get
+//      .concurrentState(fqn)
+//      .availablePermits shouldBe concurrency - 1
   }
 
   implicit val am = ActorMaterializer()
@@ -363,8 +379,6 @@ class ShardingContainerPoolBalancerTests
   val invokerMem = 2000.MB
   val concurrency = 5
   val actionMem = 256.MB
-  val namespace = EntityPath("testspace")
-  val name = EntityName("testname")
   val actionMetaData =
     WhiskActionMetaData(
       namespace,
@@ -379,7 +393,8 @@ class ShardingContainerPoolBalancerTests
   // - no containers started
   // - containers started but no concurrency room
   // - no concurrency room and no memory room to launch new containers
-  (1 until maxActivations).foreach { i =>
+  //(1 until maxActivations).foreach { i =>
+  (75 until maxActivations).foreach { i =>
     it should s"reflect concurrent processing ${i} state in containerSlots" in {
       //each batch will:
       // - submit activations concurrently
@@ -484,9 +499,12 @@ class ShardingContainerPoolBalancerTests
     var nextInvoker = home
     ids.toList.grouped(maxActivationsPerInvoker).zipWithIndex.foreach { g =>
       val remaining = rem(g._1.size)
-      balancer.schedulingState
-        ._containerSlots(fqn)(invokers(nextInvoker).id)
-        .availablePermits shouldBe remaining
+      val leftover = balancer.schedulingState._invokerSlots
+        .lift(nextInvoker)
+        .get
+        .concurrentState(fqn.toString)
+        .availablePermits
+      leftover shouldBe remaining
       nextInvoker = (nextInvoker + stepSize) % numInvokers
     }
 
@@ -500,7 +518,15 @@ class ShardingContainerPoolBalancerTests
 
     //verify invokers go back to unused state
     invokers.foreach { i =>
-      balancer.schedulingState._containerSlots(fqn).get(i.id).map(_.availablePermits shouldBe 0)
+      val invokerStates = balancer.schedulingState._invokerSlots
+        .lift(i.id.toInt)
+        .get
+        .concurrentState
+        .get(fqn.toString)
+
+      invokerStates.map { cstate =>
+        cstate.availablePermits shouldBe 0
+      }
       balancer.schedulingState._invokerSlots.lift(i.id.toInt).map(_.availablePermits shouldBe invokerMem.toMB)
 
     }
