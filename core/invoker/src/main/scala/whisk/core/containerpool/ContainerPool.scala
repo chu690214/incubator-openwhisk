@@ -140,15 +140,24 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
 
         createdContainer match {
           case Some(((actor, data), containerState)) =>
+            //increment active count before storing in pool map
+            val newData = data match {
+              case p: PreWarmedData => p.incrementActive
+              case w: WarmedData    => w.incrementActive
+              case _                => data //in case of NoData or MemoryData,
+            }
             //only move to busyPool if max reached
-            if (data.activeActivationCount + 1 >= r.action.limits.concurrency.maxConcurrent) {
+            if (newData.activeActivationCount >= r.action.limits.concurrency.maxConcurrent) {
               if (r.action.limits.concurrency.maxConcurrent > 1) {
                 logging.info(
                   this,
-                  s"container for ${r.action} is now busy with ${data.activeActivationCount + 1} activations")
+                  s"container for ${r.action} is now busy with ${newData.activeActivationCount} activations")
               }
-              busyPool = busyPool + (actor -> data)
+              busyPool = busyPool + (actor -> newData)
               freePool = freePool - actor
+            } else {
+              //update freePool to track counts
+              freePool = freePool + (actor -> newData)
             }
             // Remove the action that get's executed now from the buffer and execute the next one afterwards.
             if (isResentFromBuffer) {
@@ -159,7 +168,7 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
               runBuffer.dequeueOption.foreach { case (run, _) => self ! run }
             }
             actor ! r // forwards the run request to the container
-            logContainerStart(r, containerState, data.activeActivationCount)
+            logContainerStart(r, containerState, newData.activeActivationCount)
           case None =>
             // this can also happen if createContainer fails to start a new container, or
             // if a job is rescheduled but the container it was allocated to has not yet destroyed itself
@@ -195,32 +204,43 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
     // Container is free to take more work
     case NeedWork(data: WarmedData) =>
       feed ! MessageFeed.Processed
-      if (data.activeActivationCount < data.action.limits.concurrency.maxConcurrent) {
+      val old = freePool.get(sender()).orElse(busyPool.get(sender()))
+      val (newData, oldCount) = old match {
+        case Some(oldData: WarmedData) =>
+          //decrement active count (if previous was prewarm, the active count will be 0)
+          (oldData.decrementActive, oldData.activeActivationCount)
+        case Some(oldData: PreWarmedData) =>
+          //init is done, but run is not; retain active count
+          (data.copy(activeActivationCount = 1), oldData.activeActivationCount)
+        case Some(oldData: NoData) =>
+          //when NoData (cold start); retain active count
+          (data.copy(activeActivationCount = oldData.activeActivationCount), oldData.activeActivationCount)
+        case Some(oldData: MemoryData) =>
+          //when MemoryData (cold start); retain active count
+          (data.copy(activeActivationCount = oldData.activeActivationCount), oldData.activeActivationCount)
+        case None => {
+          //should never happen
+          logging.warn(this, s"no pool ref found for container ${data.container}")
+          (data.copy(activeActivationCount = 0), 0)
+        }
+      }
+
+      if (newData.activeActivationCount < newData.action.limits.concurrency.maxConcurrent) {
         //remove from busy pool (may already not be there), put back into free pool (to update activation counts)
-        freePool = freePool + (sender() -> data)
+        freePool = freePool + (sender() -> newData)
+        if (newData.action.limits.concurrency.maxConcurrent > 1 && newData.activeActivationCount == 0 && oldCount >= 1) {
+          logging.info(this, s"concurrent container ${newData.container} completed all activations")
+        }
         if (busyPool.contains(sender())) {
           busyPool = busyPool - sender()
-          if (data.action.limits.concurrency.maxConcurrent > 1) {
+          if (newData.action.limits.concurrency.maxConcurrent > 1) {
             logging.info(
               this,
-              s"container for ${data.action} is no longer busy with ${data.activeActivationCount} activations")
+              s"concurrent container ${newData.container} is no longer busy with ${newData.activeActivationCount} activations")
           }
         }
       } else {
-        //update freePool IFF it was previously PreWarmedData (it is still free, but now has WarmedData)
-        //otherwise update busyPool to reflect the updated activation counts
-        freePool.get(sender()) match {
-          case Some(_: PreWarmedData) =>
-            freePool = freePool + (sender() -> data)
-          case None =>
-            if (data.action.limits.concurrency.maxConcurrent > 1) {
-              logging.info(
-                this,
-                s"container for ${data.action} is now busy with ${data.activeActivationCount} activations")
-            }
-            busyPool = busyPool + (sender() -> data)
-          case _ => //was free+WarmedData - do nothing
-        }
+        busyPool = busyPool + (sender() -> newData)
       }
 
     // Container is prewarmed and ready to take work

@@ -52,26 +52,25 @@ case object Paused extends ContainerState
 case object Removing extends ContainerState
 
 // Data
-sealed abstract class ContainerData(val lastUsed: Instant,
-                                    val memoryLimit: ByteSize,
-                                    val activeActivationCount: Int = 0)
-case class NoData() extends ContainerData(Instant.EPOCH, 0.B)
-case class MemoryData(override val memoryLimit: ByteSize) extends ContainerData(Instant.EPOCH, memoryLimit)
+sealed abstract class ContainerData(val lastUsed: Instant, val memoryLimit: ByteSize, val activeActivationCount: Int)
+case class NoData() extends ContainerData(Instant.EPOCH, 0.B, 0)
+case class MemoryData(override val memoryLimit: ByteSize) extends ContainerData(Instant.EPOCH, memoryLimit, 0)
 case class PreWarmedData(container: Container,
                          kind: String,
                          override val memoryLimit: ByteSize,
                          override val activeActivationCount: Int = 0)
-    extends ContainerData(Instant.EPOCH, memoryLimit, activeActivationCount)
+    extends ContainerData(Instant.EPOCH, memoryLimit, activeActivationCount) {
+  def incrementActive = this.copy(activeActivationCount = activeActivationCount + 1)
+  def decrementActive = this.copy(activeActivationCount = activeActivationCount - 1)
+}
 case class WarmedData(container: Container,
                       invocationNamespace: EntityName,
                       action: ExecutableWhiskAction,
                       override val lastUsed: Instant,
                       override val activeActivationCount: Int = 0)
-    extends ContainerData(lastUsed, action.limits.memory.megabytes.MB) {
-  def incrementActive: WarmedData =
-    WarmedData(container, invocationNamespace, action, Instant.now, activeActivationCount + 1)
-  def decrementActive: WarmedData =
-    WarmedData(container, invocationNamespace, action, Instant.now, activeActivationCount - 1)
+    extends ContainerData(lastUsed, action.limits.memory.megabytes.MB, activeActivationCount) {
+  def incrementActive = this.copy(activeActivationCount = activeActivationCount + 1)
+  def decrementActive = this.copy(activeActivationCount = activeActivationCount - 1)
 }
 
 // Events received by the actor
@@ -120,6 +119,8 @@ class ContainerProxy(
   implicit val logging = new AkkaLogging(context.system.log)
   var rescheduleJob = false // true iff actor receives a job but cannot process it because actor will destroy itself
 
+  //keep a separate count to avoid confusion with ContainerState.activeActivationCount that is tracked/modified only in ContainerPool
+  var activeCount = 0;
   startWith(Uninitialized, NoData())
 
   when(Uninitialized) {
@@ -140,7 +141,7 @@ class ContainerProxy(
     // cold start (no container to reuse or available stem cell container)
     case Event(job: Run, _) =>
       implicit val transid = job.msg.transid
-
+      activeCount += 1
       // create a new container
       val container = factory(
         job.msg.transid,
@@ -209,6 +210,7 @@ class ContainerProxy(
   when(Started) {
     case Event(job: Run, data: PreWarmedData) =>
       implicit val transid = job.msg.transid
+      activeCount += 1
       initializeAndRun(data.container, job)
         .map(_ => WarmedData(data.container, job.msg.user.namespace.name, job.action, Instant.now))
         .pipeTo(self)
@@ -229,52 +231,63 @@ class ContainerProxy(
       stay using data
 
     // Run was successful
-    case Event(_: WarmedData, s: WarmedData) =>
-      val newData = s.decrementActive
+    case Event(data: WarmedData, s: WarmedData) =>
+      activeCount -= 1
 
-      context.parent ! NeedWork(newData)
+      context.parent ! NeedWork(data)
 
-      if (newData.activeActivationCount > 0) {
-        stay using newData
+      if (activeCount > 0) {
+        stay using data
       } else {
-        goto(Ready) using newData
+        goto(Ready) using data
       }
 
-    case Event(job: Run, data: WarmedData)
-        if stateData.activeActivationCount < data.action.limits.concurrency.maxConcurrent && !rescheduleJob => //if there was a delay, or a failure on resume, skip the run
-
+    //if there was a delay, or a failure on resume, skip the run
+    //we should never exceed the activeActivationCount since counting occurs in ContainerPool, but be defensive
+    case Event(job: Run, data: WarmedData) if !rescheduleJob =>
+      activeCount += 1
       implicit val transid = job.msg.transid
-      val newData = data.incrementActive
 
       initializeAndRun(data.container, job)
         .map(_ => WarmedData(data.container, job.msg.user.namespace.name, job.action, Instant.now))
         .pipeTo(self)
-      stay() using newData
+      stay() using data
 
     // Failed after /init (the first run failed)
-    case Event(_: FailureMessage, data: PreWarmedData) => destroyContainer(data.container)
+    case Event(_: FailureMessage, data: PreWarmedData) =>
+      activeCount -= 1
+      destroyContainer(data.container)
 
     // Failed for a subsequent /run
-    case Event(_: FailureMessage, data: WarmedData) => destroyContainer(data.container)
+    case Event(_: FailureMessage, data: WarmedData) =>
+      activeCount -= 1
+      destroyContainer(data.container)
 
     // Failed at getting a container for a cold-start run
     case Event(_: FailureMessage, _) =>
+      activeCount -= 1
       context.parent ! ContainerRemoved
       stop()
-
+    //we should never exceed the activeActivationCount since counting occurs in ContainerPool, log a warning in case this happens
+    case Event(job: Run, data: WarmedData)
+        if stateData.activeActivationCount >= data.action.limits.concurrency.maxConcurrent =>
+      logging.warn(
+        this,
+        s"invalid Run with concurrency ${stateData.activeActivationCount} of ${data.action.limits.concurrency.maxConcurrent} ")
+      delay
     case _ => delay
   }
 
   when(Ready, stateTimeout = pauseGrace) {
     case Event(job: Run, data: WarmedData) =>
       implicit val transid = job.msg.transid
-      val newData = data.incrementActive
+      activeCount += 1
 
       initializeAndRun(data.container, job)
         .map(_ => WarmedData(data.container, job.msg.user.namespace.name, job.action, Instant.now))
         .pipeTo(self)
 
-      goto(Running) using newData
+      goto(Running) using data
 
     // pause grace timed out
     case Event(StateTimeout, data: WarmedData) =>
@@ -293,7 +306,7 @@ class ContainerProxy(
   when(Paused, stateTimeout = unusedTimeout) {
     case Event(job: Run, data: WarmedData) =>
       implicit val transid = job.msg.transid
-      val newData = data.incrementActive
+      activeCount += 1
 
       data.container
         .resume()
@@ -309,7 +322,7 @@ class ContainerProxy(
         .map(_ => WarmedData(data.container, job.msg.user.namespace.name, job.action, Instant.now))
         .pipeTo(self)
 
-      goto(Running) using newData
+      goto(Running) using data
 
     // container is reclaimed by the pool or it has become too old
     case Event(StateTimeout | Remove, data: WarmedData) =>
