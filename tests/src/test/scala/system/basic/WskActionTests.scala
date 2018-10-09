@@ -67,7 +67,9 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
     withActivation(wsk.activation, run) { activation =>
       activation.response.status shouldBe "success"
       activation.response.result shouldBe Some(testResult)
-      activation.logs.get.mkString(" ") should include(testString)
+      checkLogs(activation, logs => {
+        logs.mkString(" ") should include(testString)
+      })
     }
   }
 
@@ -85,12 +87,12 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
     val invokeParams = Map("payload" -> testString)
     val run = wsk.action.invoke(name, invokeParams.mapValues(_.toJson))
     withActivation(wsk.activation, run) { activation =>
-      val logs = activation.logs.get.mkString(" ")
-
-      (params ++ invokeParams).foreach {
-        case (key, value) =>
-          logs should include(s"params.$key: $value")
-      }
+      checkLogs(activation, logs => {
+        (params ++ invokeParams).foreach {
+          case (key, value) =>
+            logs.get.mkString(" ") should include(s"params.$key: $value")
+        }
+      })
     }
   }
 
@@ -118,7 +120,10 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
     withActivation(wsk.activation, run) { activation =>
       activation.response.status shouldBe "success"
       activation.response.result shouldBe Some(testResult)
-      activation.logs.get.mkString(" ") should include(testString)
+      checkLogs(activation, logs => {
+        logs.get.mkString(" ") should include(testString)
+      })
+
     }
   }
 
@@ -166,7 +171,7 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
         JsObject("key" -> JsString("copiedAnnot2"), "value" -> JsBoolean(false)),
         JsObject("key" -> JsString("copiedAnnot1"), "value" -> JsString("copiedAnnotValue1")),
         JsObject("key" -> JsString("origAnnot2"), "value" -> JsBoolean(true)),
-        JsObject("key" -> JsString("exec"), "value" -> JsString("nodejs:6")))
+        JsObject("key" -> JsString("exec"), "value" -> JsString("nodejs:10-fat")))
 
       assetHelper.withCleaner(wsk.action, origName) {
         val file = Some(TestUtils.getTestActionFilename("echo.js"))
@@ -195,7 +200,9 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
     val run1 = wsk.action.invoke(name, Map("payload" -> testString.toJson))
     withActivation(wsk.activation, run1) { activation =>
       activation.response.status shouldBe "success"
-      activation.logs.get.mkString(" ") should include(s"The message '$testString' has")
+      checkLogs(activation, logs => {
+        logs.get.mkString(" ") should include(s"The message '$testString' has")
+      })
     }
 
     wsk.action.delete(name)
@@ -206,7 +213,9 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
     val run2 = wsk.action.invoke(name, Map("payload" -> testString.toJson))
     withActivation(wsk.activation, run2) { activation =>
       activation.response.status shouldBe "success"
-      activation.logs.get.mkString(" ") should include(s"hello, $testString")
+      checkLogs(activation, logs => {
+        logs.get.mkString(" ") should include(s"hello, $testString")
+      })
     }
   }
 
@@ -276,17 +285,31 @@ class WskActionTests extends TestHelpers with WskTestHelpers with JsHelpers with
     }
   }
 
-  it should "support UTF-8 as input and output format" in withAssetCleaner(wskprops) { (wp, assetHelper) =>
-    val name = "utf8Test"
-    assetHelper.withCleaner(wsk.action, name) { (action, _) =>
-      action.create(name, Some(TestUtils.getTestActionFilename("hello.js")))
-    }
+  if (WhiskProperties.isUTFLogstore) {
+    it should "support UTF-8 as input and output format" in withAssetCleaner(wskprops) { (wp, assetHelper) =>
+      val name = "utf8Test"
+      assetHelper.withCleaner(wsk.action, name) { (action, _) =>
+        action.create(name, Some(TestUtils.getTestActionFilename("hello.js")))
+      }
 
-    val utf8 = "«ταБЬℓσö»: 1<2 & 4+1>³, now 20%€§$ off!"
-    val run = wsk.action.invoke(name, Map("payload" -> utf8.toJson))
-    withActivation(wsk.activation, run) { activation =>
-      activation.response.status shouldBe "success"
-      activation.logs.get.mkString(" ") should include(s"hello, $utf8")
+      val utf8 = "«ταБЬℓσö»: 1<2 & 4+1>³, now 20%€§$ off!"
+      val run = wsk.action.invoke(name, Map("payload" -> utf8.toJson))
+      withActivation(wsk.activation, run) { activation =>
+        activation.response.status shouldBe "success"
+        checkLogs(activation, logs => {
+          logs.get.mkString(" ") should include(s"hello, $utf8")
+        })
+      }
+    }
+  }
+
+  def checkLogs(activation: ActivationResult, check: (Option[List[String]]) => Unit) = {
+    if (WhiskProperties.isExternalLogstore) {
+      withActivationLogs(wsk.activation, activation.activationId) { activationLogs =>
+        check(activationLogs.logs)
+      }
+    } else {
+      check(activation.logs)
     }
   }
 }
